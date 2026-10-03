@@ -86,8 +86,10 @@ pick_python() {
 echo "[1/8] Finding a Python with a usable Tk..."
 PY="$(pick_python)" || {
   echo "      None found. Installing Python and Tk through Homebrew..."
-  brew_install python python-tk
-  PY="$(pick_python)" || die "Even after installing python and python-tk, no interpreter reports Tk 8.6+."
+  # a named version, not plain "python": Homebrew's default moves on, and a
+  # version newer than the list above would install and then not be found
+  brew_install python@3.14 python-tk@3.14
+  PY="$(pick_python)" || die "Even after installing python@3.14 and python-tk@3.14, no interpreter reports Tk 8.6+."
 }
 echo "      using $PY"
 "$PY" -c 'import sys,tkinter;print("      python",sys.version.split()[0],"tk",tkinter.TkVersion)'
@@ -111,9 +113,12 @@ BAKE="${VERBATIM_BAKE:-parakeet-v2}"
 BAKE_IDS="support $BAKE"
 [ "$BAKE" = "none" ] && BAKE_IDS="support"
 echo "[5/8] Downloading the speech models to bake in ($BAKE_IDS)..."
-echo "      About 500 MB the first time; kept in build-models for later builds."
+echo "      About 500 MB to download the first time; kept in build-models for later builds."
+# --stage copies exactly the models named here into a fresh build-bake folder,
+# so a model fetched for an earlier build is not baked into this one as well.
 # shellcheck disable=SC2086
-"$VPY" "$HERE/verbatim.py" fetch --into "$HERE/build-models" $BAKE_IDS || die "The models would not download."
+"$VPY" "$HERE/verbatim.py" fetch --into "$HERE/build-models" --stage "$HERE/build-bake" $BAKE_IDS \
+  || die "The models would not download."
 
 echo "[6/8] Packaging (this takes a few minutes)..."
 rm -rf "$HERE/build" "$HERE/dist"
@@ -126,7 +131,7 @@ rm -rf "$HERE/build" "$HERE/dist"
   --collect-all certifi \
   --collect-submodules verbatimlib \
   --add-data "verbatimlib/data:verbatimlib/data" \
-  --add-data "build-models:models" \
+  --add-data "build-bake:models" \
   --hidden-import tkinter \
   --hidden-import tkinter.ttk \
   --hidden-import tkinter.filedialog \
@@ -134,6 +139,8 @@ rm -rf "$HERE/build" "$HERE/dist"
   --exclude-module pytest \
   "$HERE/verbatim_app.py" || die "PyInstaller failed - see the log above."
 [ -d "$HERE/dist/Verbatim.app" ] || die "dist/Verbatim.app was not produced."
+# PyInstaller leaves a second, unbundled copy of everything beside the .app
+rm -rf "$HERE/dist/Verbatim"
 
 echo "[7/8] Clearing quarantine and signing locally..."
 # Without these two an app built on Apple silicon is killed the moment it opens.

@@ -80,6 +80,8 @@ def run(argv: List[str]) -> int:
     rep.say(f"Python {sys.version.split()[0]} on {platform.system()} {platform.release()} {platform.machine()}"
             f"{' (frozen build)' if getattr(sys, 'frozen', False) else ' (from source)'}")
     rep.say(f"App folder: {paths.app_dir()}")
+    if paths.data_dir() != paths.app_dir():
+        rep.say(f"Settings and models: {paths.data_dir()} (the app folder cannot be written to)")
     rep.say()
     tmp = tempfile.mkdtemp(prefix="verbatim-selftest-")
 
@@ -136,17 +138,30 @@ def run(argv: List[str]) -> int:
 
     def filters_ok():
         from . import filters as f
-        drop = [("Thanks for watching!", 2.0, None), ("Subtitles by the Amara.org community", 4.0, None),
-                ("[Music]", 6.0, None), ("(crying)", 5.0, None), ("Gracias por ver el video.", 5.0, None),
-                ("H-h-h-h-h-h-h-h-h-h-h-h-h-h", 5.0, None), ("1/2 tbps", 12.0, None), ("so", 12.0, None),
-                ("I think so. " * 8, 6.0, None), ("Okay.", 0.6, 0.2), ("Thank you.", 3.0, 0.3),
-                ("the quick brown fox " * 30, 2.0, 0.9)]
-        keep = [("Good morning everyone, thanks for joining.", 3.0, 0.94), ("Yes.", 0.5, 0.9), ("1, 2, 3", 1.5, None),
-                ("No, no, no, no. I do not agree.", 3.0, 0.9), ("Thank you.", 1.0, 0.95),
+        # (text, seconds of audio, model confidence or None, isolated by silence either side)
+        drop = [("Thanks for watching!", 2.0, None, False), ("Subtitles by the Amara.org community", 4.0, None, False),
+                ("[Music]", 6.0, None, False), ("(crying)", 5.0, None, False), ("[VIDEO PLAYBACK]", 1.0, None, False),
+                ("Gracias por ver el video.", 5.0, None, False), ("H-h-h-h-h-h-h-h-h-h-h-h-h-h", 5.0, None, False),
+                ("1/2 tbps", 12.0, None, False), ("so", 12.0, None, False), ("I think so. " * 8, 6.0, None, False),
+                ("Okay.", 0.6, 0.2, False), ("Thank you.", 3.0, 0.3, False), ("the quick brown fox " * 30, 2.0, 0.9, False),
+                ("you", 2.0, None, True), ("Thank you.", 1.5, None, True), ("Bye-bye.", 0.8, None, True),
+                ("Thanks for watching, and I'll see you in the next video.", 3.0, None, False),
+                ("Like, share, subscribe.", 2.0, None, False), ("3.5mm", 3.0, None, True),
+                ("1.0.1.1.1.1.1.1.1", 3.0, None, False), ("google.com", 1.5, None, True)]
+        keep = [("Good morning everyone, thanks for joining.", 3.0, 0.94), ("Yes.", 0.5, 0.9), ("No.", 0.7, 0.95),
+                ("OK.", 0.8, 0.95), ("I do.", 1.4, 0.95), ("25.", 1.0, 0.95), ("1, 2, 3", 1.5, None),
+                ("No, no, no, no, no, no.", 2.5, 0.95), ("Thank you.", 1.0, 0.95), ("Thank you.", 1.0, None),
+                ("Bye-bye.", 0.8, None), ("See you next time.", 1.2, None), ("case-uk.co.uk", 1.5, 0.95),
                 ("Thanks for watching the demo, Sarah will follow up.", 3.0, 0.9),
-                ("That is a very, very, very good point.", 2.0, None)]
-        for text, dur, conf in drop:
-            kept, _why = f.judge(text, dur, conf, "balanced", 0.0)
+                ("That is a very, very, very good point.", 2.0, None),
+                ("Translated by a colleague of mine, the document was then sent to the board for approval last week.",
+                 7.0, 0.95),
+                ("Subscribe to the newsletter if you want the monthly budget updates, and I will send the first one "
+                 "on Friday.", 7.0, None),
+                ("He said (sound good to you?) and I agreed", 3.0, 0.9),
+                ("(Hello everyone and welcome to the meeting", 3.0, 0.9)]
+        for text, dur, conf, isolated in drop:
+            kept, _why = f.judge(text, dur, conf, "balanced", 0.0, isolated=isolated)
             if kept:
                 raise AssertionError(f"should have been left out: {text[:40]!r}")
         for text, dur, conf in keep:
@@ -155,6 +170,12 @@ def run(argv: List[str]) -> int:
                 raise AssertionError(f"should have been kept as said: {text!r} -> {kept!r}")
         if f.judge("Thanks for watching!", 2.0, None, "off", 0.0)[0] != "Thanks for watching!":
             raise AssertionError("filtering 'off' must pass everything through")
+        if f.phantom("See you next time.") or not f.phantom("Thanks for watching!"):
+            raise AssertionError("a phrase tacked on after real speech was judged wrongly")
+        start = time.time()
+        f.judge("(a " * 40 + "x) hello", 3.0, None)
+        if time.time() - start > 1.0:
+            raise AssertionError("a pattern is backtracking")
         return f"{len(drop)} phantom pieces dropped, {len(keep)} real ones kept"
     rep.check("invented-text filter", filters_ok)
 
@@ -193,14 +214,20 @@ def run(argv: List[str]) -> int:
             raise AssertionError("sentence times are wrong")
         if [g["speaker"] for g in e.words_to_segments(said, None)] != [None, None, None]:
             raise AssertionError("without speaker labels every sentence must be unlabelled")
+        doc = [(0.0, 0.2, "I"), (0.3, 0.5, "saw"), (0.6, 0.8, "Dr."), (0.9, 1.2, "Smith"), (1.3, 1.6, "today."),
+               (1.8, 2.0, "Fine.")]
+        if [g["text"] for g in e.words_to_segments(doc, None)] != ["I saw Dr. Smith today.", "Fine."]:
+            raise AssertionError("an abbreviation ended a sentence")
         return "each word goes to one speaker; a late hand-over snaps to the sentence"
     rep.check("sharing words out between speakers", words_ok)
 
     def refine_ok():
         import numpy as np
         from . import engine as e
-        a, b = np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])
-        voice = {0: a, 1: b, 2: a * 0.97 + b * 0.05, 3: b * 0.9 + a * 0.2, 4: np.array([0.0, 0.0, 1.0])}
+        a, b, c, d = np.eye(4)
+        # two takes of voice A (one through a different microphone), voice B, voice C,
+        # and a 1.5 s scrap that sounds a little like B and like nobody else
+        voice = {0: a, 1: b, 2: 0.8 * a + 0.6 * d, 3: 0.35 * b + 0.94 * d - 0.1 * a, 4: c}
         turns = [(0, 10, 0), (10, 20, 1), (20, 30, 2), (30, 31.5, 3), (31.5, 41.5, 4)]
 
         def fp(s, _e):
@@ -214,7 +241,14 @@ def run(argv: List[str]) -> int:
         fixed, _ = e.refine_speakers(turns, fp, 2)
         if len({k for _s, _e, k in fixed}) != 2:
             raise AssertionError("a fixed count of 2 was not honoured")
-        return "same voice merged, a 1.5 s scrap rehomed, fixed count honoured"
+        # in a short clip a few seconds can be a whole person: 4 s against 5 s, quite unalike
+        short = [(0, 5, 0), (5, 9, 1)]
+        if len({k for _s, _e, k in e.refine_speakers(short, lambda s, _e: a if s == 0 else b, 0)[0]}) != 2:
+            raise AssertionError("a second speaker in a short clip was folded away as a scrap")
+        frames = e.speaker_frames([(0.0, 30.0, 0), (10.0, 15.0, 1), (20.0, 20.4, 1)], 30 * e.RATE)
+        if not (frames[1200] == 1 and frames[2020] == 0 and frames[500] == 0):
+            raise AssertionError("overlapping turns were laid down wrongly")
+        return "same voice merged, a 1.5 s scrap rehomed, fixed count honoured, short clips keep both speakers"
     rep.check("speaker merging", refine_ok)
 
     transcript = {
@@ -378,17 +412,21 @@ def run(argv: List[str]) -> int:
             raise Skip("--quick")
         if asr is None or not support:
             raise Skip("models are not downloaded yet")
-        from .ui import _no_window, engine_command
+        from . import proc
         jobdir = os.path.join(tmp, "job")
         os.makedirs(jobdir)
-        job = {"file": _sample(), "options": {"model": asr, "speakers": True},
+        job = {"file": _sample(), "options": {"model": asr, "speakers": True, "parallel": "on"},
                "events": os.path.join(jobdir, "events.jsonl"), "result": os.path.join(jobdir, "result.json"),
-               "workdir": jobdir}
+               "cancel": os.path.join(jobdir, "cancel"), "workdir": jobdir}
         with open(os.path.join(jobdir, "job.json"), "w", encoding="utf-8") as fh:
             json.dump(job, fh)
         with open(os.path.join(jobdir, "engine.log"), "wb") as log:
-            code = subprocess.run(engine_command(os.path.join(jobdir, "job.json")), stdin=subprocess.DEVNULL,
-                                  stdout=log, stderr=subprocess.STDOUT, timeout=900, **_no_window()).returncode
+            engine_proc = proc.start_engine(os.path.join(jobdir, "job.json"), log)
+            try:
+                code = engine_proc.wait(timeout=900)
+            except subprocess.TimeoutExpired:
+                proc.kill_tree(engine_proc)
+                raise AssertionError("the engine did not finish in 15 minutes")
         with open(job["events"], "rb") as fh:
             events = [json.loads(ln.decode("utf-8")) for ln in fh.read().splitlines() if ln.strip()]
         if code != 0 or not os.path.isfile(job["result"]):
@@ -400,7 +438,9 @@ def run(argv: List[str]) -> int:
         result = json.load(open(job["result"], encoding="utf-8"))
         if not result["segments"]:
             raise AssertionError("the engine returned an empty transcript")
-        return f"separate engine process ran and reported {len(events)} events"
+        if not result["stats"].get("parallel"):
+            raise AssertionError("the engine ignored the request to run both stages at once")
+        return f"separate engine process ran both stages at once and reported {len(events)} events"
     rep.check("the window's engine process", engine_ok)
 
     def window_ok():
@@ -423,13 +463,28 @@ def run(argv: List[str]) -> int:
                 app.toggle_theme()
                 root.update()
                 app.toggle_theme()
+                import copy
                 item = next(iter(app.items.values()))
-                item.result, item.state = transcript, "done"
+                item.result, item.state = copy.deepcopy(transcript), "done"
                 app._show(item)
                 root.update()
                 shown = app.text.get("1.0", "end")
                 if "Dan" not in shown or "budget" not in shown:
                     raise AssertionError("the transcript pane did not show the transcript")
+                # hand the first paragraph to the other speaker, as the right-click menu does
+                app._reassign(item, item.result, list(app._para_spans[0]["segments"]), "S2")
+                root.update()
+                if item.result["segments"][0]["speaker"] != "S2":
+                    raise AssertionError("changing a paragraph's speaker did nothing")
+                # a saved transcript opens again
+                saved_json = os.path.join(tmp, "reopen.json")
+                with open(saved_json, "w", encoding="utf-8") as fh:
+                    json.dump(transcript, fh)
+                before = len(app.items)
+                app.add_paths([saved_json])
+                root.update()
+                if len(app.items) != before + 1 or "Dan" not in app.text.get("1.0", "end"):
+                    raise AssertionError("a saved transcript did not reopen")
                 tkv = root.tk.call("info", "patchlevel")
                 dnd = "with drag and drop" if ui._HAVE_DND else "no drag and drop (tkinterdnd2 unavailable)"
                 app._closing = True
@@ -444,9 +499,11 @@ def run(argv: List[str]) -> int:
     rep.say()
     rep.say(f"{rep.passed} passed, {rep.failed} failed, {rep.skipped} skipped")
     rep.say("PROBLEMS FOUND" if rep.failed else "ALL GOOD")
-    try:
-        with io.open(os.path.join(paths.app_dir(), "verbatim-selftest.txt"), "w", encoding="utf-8") as fh:
-            fh.write("\n".join(rep.lines) + "\n")
-    except OSError:
-        pass
+    for folder in (paths.app_dir(), paths.data_dir()):
+        try:
+            with io.open(os.path.join(folder, "verbatim-selftest.txt"), "w", encoding="utf-8") as fh:
+                fh.write("\n".join(rep.lines) + "\n")
+            break
+        except OSError:
+            continue
     return 1 if rep.failed else 0

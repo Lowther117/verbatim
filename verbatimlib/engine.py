@@ -15,7 +15,8 @@ Why the stages are in this order, since it is what keeps invented text out:
    being mistaken for speech and stops the speaker stage splitting one voice
    into two because the background changed.
 3. Speaker turns come from a segmentation model plus a voice-fingerprint model;
-   voices that barely appear are folded into their neighbour rather than
+   groups that sound like the same person are merged, and voices that barely
+   appear are folded into the speaker they sound most like rather than
    becoming a "Speaker 7" who said one word.
 4. Each stretch of speech is transcribed on its own, and what comes back is
    checked (filters.py) before it is accepted.
@@ -24,8 +25,11 @@ from __future__ import annotations
 
 import gc
 import os
+import sys
 import tempfile
+import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -51,13 +55,13 @@ class EngineError(Exception):
 @dataclass
 class Options:
     model: str = models.DEFAULT_ASR
-    language: str = ""            # Whisper only; "" = detect
-    translate: bool = False       # Whisper only: translate into English
     speakers: bool = True
     num_speakers: int = 0         # 0 = work it out
     denoise: str = "auto"         # auto | on | off
     filtering: str = "balanced"   # off | balanced | strict
     threads: int = 0              # 0 = choose from the processor
+    provider: str = "cpu"         # cpu | coreml | cuda | directml (falls back to cpu if unusable)
+    parallel: str = "auto"        # auto | on | off: find speakers and transcribe at the same time
     asr_audio: str = "original"   # original | cleaned: what the text model listens to after noise reduction
 
     @classmethod
@@ -70,11 +74,32 @@ class Options:
             o.denoise = "auto"
         if o.filtering not in filters.LEVELS:
             o.filtering = "balanced"
+        if o.provider not in PROVIDERS:
+            o.provider = "cpu"
+        if o.parallel not in ("auto", "on", "off"):
+            o.parallel = "auto"
         try:
             o.num_speakers = max(0, min(20, int(o.num_speakers)))
         except (TypeError, ValueError):
             o.num_speakers = 0
         return o
+
+
+PROVIDERS = ("cpu", "coreml", "cuda", "directml")
+
+
+def gpu_candidates() -> List[str]:
+    """Graphics-processor back ends worth trying on this kind of computer.
+
+    Whether one is actually usable (and actually faster) is only known by
+    trying it - see the speed test. The engine falls back to the processor by
+    itself when a back end is not in this build or has no hardware to use.
+    """
+    if sys.platform == "darwin":
+        return ["coreml"]
+    if sys.platform.startswith("win"):
+        return ["cuda", "directml"]
+    return ["cuda"]
 
 
 def default_threads() -> int:
@@ -198,22 +223,23 @@ def reduce_noise(samples: np.ndarray, model_path: str, out_path: str, threads: i
 
 
 def diarize(samples: np.ndarray, seg_path: str, emb_path: str, num_speakers: int, threads: int,
-            progress: Optional[Callable[[float], None]] = None) -> Tuple[List[Tuple[float, float, int]], int]:
+            progress: Optional[Callable[[float], None]] = None,
+            provider: str = "cpu") -> Tuple[List[Tuple[float, float, int]], int]:
     """Speaker turns as (start_seconds, end_seconds, speaker_index), plus how many
     stray voices were folded into a real speaker.
 
     Two passes. The library's own pass finds the turns and groups them by
-    voice, deliberately erring towards too many groups. The second pass
+    voice, deliberately erring towards far too many groups. The second pass
     (refine_speakers) averages each group's voice fingerprint over everything
-    it said - far steadier than any single snippet - and uses those averages
-    to merge groups that are the same person and to rehome scraps.
+    it said - much steadier than any single snippet - and uses those averages
+    to merge the groups that are the same person and to rehome scraps.
     """
     so = _sherpa()
-    emb_cfg = so.SpeakerEmbeddingExtractorConfig(model=emb_path, num_threads=threads)
+    emb_cfg = so.SpeakerEmbeddingExtractorConfig(model=emb_path, num_threads=threads, provider=provider)
     cfg = so.OfflineSpeakerDiarizationConfig(
         segmentation=so.OfflineSpeakerSegmentationModelConfig(
             pyannote=so.OfflineSpeakerSegmentationPyannoteModelConfig(model=seg_path),
-            num_threads=threads),
+            num_threads=threads, provider=provider),
         embedding=emb_cfg,
         clustering=so.FastClusteringConfig(num_clusters=-1, threshold=CLUSTER_THRESHOLD),
         min_duration_on=0.3, min_duration_off=0.5)
@@ -224,22 +250,28 @@ def diarize(samples: np.ndarray, seg_path: str, emb_path: str, num_speakers: int
 
     def cb(done: int, total: int) -> int:
         if progress and total:
-            progress(0.9 * done / total)
+            progress(0.8 * done / total)
         return 0
 
     result = sd.process(data, callback=cb).sort_by_start_time()
     turns = [(float(r.start), float(r.end), int(r.speaker)) for r in result]
-    if len({k for _s, _e, k in turns}) <= 1 and num_speakers <= 1:
+    found = len({k for _s, _e, k in turns})
+    if found <= 1 and num_speakers <= 1:
         return turns, 0
-    if num_speakers > 0 and len({k for _s, _e, k in turns}) < num_speakers:
+    if num_speakers > found and len(turns) >= num_speakers:
         # the first pass found fewer voices than the user says there are: ask for exactly that many
         cfg.clustering = so.FastClusteringConfig(num_clusters=num_speakers, threshold=CLUSTER_THRESHOLD)
         sd = so.OfflineSpeakerDiarization(cfg)
         result = sd.process(data).sort_by_start_time()
         turns = [(float(r.start), float(r.end), int(r.speaker)) for r in result]
+    del sd
     extractor = so.SpeakerEmbeddingExtractor(emb_cfg)
+    done = [0]
 
     def fingerprint(start: float, end: float) -> Optional[np.ndarray]:
+        done[0] += 1
+        if progress and turns:
+            progress(0.8 + 0.2 * min(1.0, done[0] / len(turns)))
         a, b = int(start * RATE), int(min(end, start + 15.0) * RATE)
         if b - a < int(0.4 * RATE):
             return None
@@ -258,123 +290,144 @@ def diarize(samples: np.ndarray, seg_path: str, emb_path: str, num_speakers: int
     return turns, folded
 
 
-# First pass: distance threshold for grouping voice snippets. Low on purpose -
-# it is far easier to merge two halves of one speaker afterwards than to pull
-# apart two people who were lumped together.
+# First pass: distance threshold for grouping voice snippets. Low on purpose:
+# it splits real voices into many groups (a dozen for two people is normal),
+# and it is far easier to merge the halves of one speaker afterwards than to
+# pull apart two people who were lumped together.
 CLUSTER_THRESHOLD = 0.5
 # Second pass: two groups whose averaged fingerprints are at least this alike
-# (cosine similarity) are the same person.
-MERGE_SIMILARITY = 0.78
-# A group with less audio than this in total is a scrap, not a participant.
+# (cosine similarity) are the same person. Measured on recordings of real
+# voices with level, microphone and noise changes between turns: 0.47 found
+# the right number of speakers in 27 of 32 recordings and was never out by
+# more than one. Higher splits one person into several; lower merges people.
+MERGE_SIMILARITY = 0.47
+# A group with less audio than this in total, AND less than MINOR_SHARE of all
+# the speech, is a scrap (a cough, a burst of noise, one word in an odd tone),
+# not a participant. In a short clip a few seconds can be a whole speaker,
+# which is what the share test protects.
 MINOR_SECONDS = 4.0
+MINOR_SHARE = 0.15
 
 
 def refine_speakers(turns: List[Tuple[float, float, int]], fingerprint: Callable[[float, float], Optional[np.ndarray]],
                     num_speakers: int = 0) -> Tuple[List[Tuple[float, float, int]], int]:
     """Merge speaker groups using each group's average voice fingerprint.
 
-    Without a fixed count: scraps (under MINOR_SECONDS in total - a cough, a
-    burst of noise, one word in an odd tone) join whichever real speaker they
-    sound most like, then real speakers that sound alike enough are merged.
-    With a fixed count: the smallest scraps are rehomed first so they cannot
-    use up one of the requested places, then the most alike pair is merged
-    until exactly that many remain.
+    The two most alike groups are merged, again and again. Without a fixed
+    count that stops when the closest pair is no longer alike enough to be
+    one person; scraps left over then join whichever real speaker they sound
+    most like. With a fixed count it stops at that many - and two groups that
+    are each substantial are never merged while that would leave too few, so
+    a scrap can never use up one of the requested places.
+
+    Returns the relabelled turns and how many scraps were folded in.
     """
     if not turns:
         return turns, 0
-    dur: Dict[int, float] = {}
-    vec: Dict[int, np.ndarray] = {}
+    total = sum(e - s for s, e, _k in turns)
+    groups: Dict[int, dict] = {}
     for s, e, k in turns:
-        dur[k] = dur.get(k, 0.0) + (e - s)
+        g = groups.setdefault(k, {"vec": None, "dur": 0.0, "ids": [k]})
+        g["dur"] += e - s
         v = fingerprint(s, e)
         if v is not None:
-            vec[k] = vec.get(k, 0.0) + v * (e - s)
-    if len(dur) <= 1:
+            g["vec"] = v * (e - s) if g["vec"] is None else g["vec"] + v * (e - s)
+    if len(groups) <= 1:
         return turns, 0
-    remap: Dict[int, int] = {k: k for k in dur}
+    cl = list(groups.values())
 
-    def unit(v) -> np.ndarray:
-        n = float(np.linalg.norm(v))
-        return v / n if n > 0 else v
-
-    def sim(a: int, b: int) -> float:
-        if a not in vec or b not in vec:
+    def sim(a: dict, b: dict) -> float:
+        if a["vec"] is None or b["vec"] is None:
             return -1.0
-        return float(unit(vec[a]) @ unit(vec[b]))
+        na, nb = float(np.linalg.norm(a["vec"])), float(np.linalg.norm(b["vec"]))
+        if na <= 0 or nb <= 0:
+            return -1.0
+        return float(a["vec"] @ b["vec"]) / (na * nb)
 
-    def merge(src: int, dst: int) -> None:
-        dur[dst] += dur.pop(src)
-        if src in vec:
-            vec[dst] = vec.get(dst, 0.0) + vec.pop(src)
-        for k, v in remap.items():
-            if v == src:
-                remap[k] = dst
+    def minor(g: dict) -> bool:
+        return g["dur"] < 1.0 or (g["dur"] < MINOR_SECONDS and g["dur"] < MINOR_SHARE * total)
 
-    def nearest_in_time(k: int, pool: List[int]) -> Optional[int]:
-        best, best_gap = None, 1e9
-        mine = [(s, e) for s, e, kk in turns if remap[kk] == k]
-        for s2, e2, k2 in turns:
-            r = remap[k2]
-            if r not in pool:
-                continue
-            for s, e in mine:
-                gap = max(0.0, s - e2, s2 - e)
-                if gap < best_gap:
-                    best, best_gap = r, gap
-        return best
+    def merge(i: int, j: int) -> None:
+        a, b = cl[i], cl[j]
+        a["ids"] += b["ids"]
+        a["dur"] += b["dur"]
+        if b["vec"] is not None:
+            a["vec"] = b["vec"] if a["vec"] is None else a["vec"] + b["vec"]
+        del cl[j]
+
+    while len(cl) > 1:
+        if num_speakers > 0 and len(cl) <= num_speakers:
+            break
+        majors = sum(not minor(g) for g in cl)
+        best = None
+        for i in range(len(cl)):
+            for j in range(i + 1, len(cl)):
+                if num_speakers > 0 and majors <= num_speakers and not minor(cl[i]) and not minor(cl[j]):
+                    continue
+                v = sim(cl[i], cl[j])
+                if best is None or v > best[0]:
+                    best = (v, i, j)
+        if best is None:
+            break
+        if num_speakers <= 0 and best[0] < MERGE_SIMILARITY:
+            break
+        merge(best[1], best[2])
 
     folded = 0
-    if num_speakers > 0:
-        while len(dur) > num_speakers:
-            small = min(dur, key=dur.get)
-            others = [k for k in dur if k != small]
-            if dur[small] < MINOR_SECONDS:
-                target = max(others, key=lambda k: sim(small, k))
-                if sim(small, target) < 0:
-                    target = nearest_in_time(small, others) or target
-                merge(small, target)
+    if num_speakers <= 0:
+        keep = [g for g in cl if not minor(g)]
+        if keep and len(keep) < len(cl):
+            for g in [g for g in cl if minor(g)]:
+                target = max(keep, key=lambda m: sim(m, g))
+                target["ids"] += g["ids"]
+                target["dur"] += g["dur"]
                 folded += 1
-                continue
-            pairs = [(sim(a, b), a, b) for i, a in enumerate(sorted(dur)) for b in sorted(dur)[i + 1:]]
-            _best, a, b = max(pairs)
-            if dur[a] < dur[b]:
-                a, b = b, a
-            merge(b, a)
-    else:
-        majors = [k for k in dur if dur[k] >= MINOR_SECONDS]
-        if majors:
-            for k in [k for k in dur if k not in majors]:
-                target = max(majors, key=lambda m: sim(k, m))
-                if sim(k, target) < 0:
-                    target = nearest_in_time(k, majors) or target
-                merge(k, target)
-                folded += 1
-        while len(dur) > 1:
-            keys = sorted(dur)
-            pairs = [(sim(a, b), a, b) for i, a in enumerate(keys) for b in keys[i + 1:]]
-            best, a, b = max(pairs)
-            if best < MERGE_SIMILARITY:
-                break
-            if dur[a] < dur[b]:
-                a, b = b, a
-            merge(b, a)
+            cl = keep
+    remap: Dict[int, int] = {}
+    for g in cl:
+        for k in g["ids"]:
+            remap[k] = g["ids"][0]
     return [(s, e, remap[k]) for s, e, k in turns], folded
 
 
 def speaker_frames(turns: List[Tuple[float, float, int]], total: int) -> np.ndarray:
     """Who is speaking in each 10 ms frame of the file (-1 = nobody labelled).
 
-    Longest turns are laid down first and never overwritten: a two-word
-    interjection that sits entirely inside someone else's sentence must not
-    chop that sentence in half.
+    Turns are laid down longest first. Where two overlap, a turn of a second
+    or more takes its own span - that is a second person really speaking -
+    but a shorter one only fills frames nobody holds yet: a two-word
+    interjection must not chop someone else's sentence in half.
     """
     nframes = total // (RATE // 100) + 1
     label = np.full(nframes, -1, dtype=np.int32)
     for s, e, k in sorted(turns, key=lambda t: t[0] - t[1]):
         a, b = max(0, int(s * 100)), min(nframes, int(e * 100) + 1)
-        view = label[a:b]
-        view[view == -1] = k
+        if e - s >= 1.0:
+            label[a:b] = k
+        else:
+            view = label[a:b]
+            view[view == -1] = k
     return label
+
+
+_ABBREVIATIONS = {"mr.", "mrs.", "ms.", "dr.", "st.", "vs.", "e.g.", "i.e.", "prof.", "no.", "etc.", "inc.", "ltd.",
+                  "jr.", "sr.", "mt."}
+
+
+def _ends_sentence(word: str, following: Optional[str]) -> bool:
+    """Does this word end a sentence? "Dr." and "J." do not; "etc." and "no." only before a capital."""
+    if not word.endswith((".", "?", "!")) or word.endswith("..."):
+        return False
+    if not word.endswith("."):
+        return True
+    low = word.lower().lstrip("\"'([")
+    if len(low) == 2 and low[0].isalpha():          # an initial: "J."
+        return False
+    if low in _ABBREVIATIONS:
+        if low in ("etc.", "no.", "inc.", "ltd.", "jr.", "sr."):
+            return following is None or following[:1].isupper()
+        return False
+    return True
 
 
 def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.ndarray]) -> List[dict]:
@@ -427,7 +480,7 @@ def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.
         start = 0
         for i, (_ws, _we, text) in enumerate(words):
             last = i == len(words) - 1
-            if not (last or (text.endswith((".", "?", "!")) and not text.endswith("..."))):
+            if not (last or _ends_sentence(text, words[i + 1][2])):
                 continue
             idx = list(range(start, i + 1))
             start = i + 1
@@ -437,20 +490,23 @@ def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.
             if len(share) < 2:
                 continue
             major = max(share, key=share.get)
-            if share[major] < 0.6 * sum(share.values()):
+            whole = sum(share.values())
+            if share[major] < 0.6 * whole:
                 continue
             j = 0
             while j < len(idx):
                 k = j
                 while k + 1 < len(idx) and who[idx[k + 1]] == who[idx[j]]:
                     k += 1
-                if who[idx[j]] != major and k - j < 2 and words[idx[k]][1] - words[idx[j]][0] < 0.8:
+                span = words[idx[k]][1] - words[idx[j]][0]
+                if who[idx[j]] != major and ((k - j < 2 and span < 0.8)
+                                             or (span < 1.5 and share[major] >= 0.65 * whole)):
                     for m in range(j, k + 1):
                         who[idx[m]] = major
                 j = k + 1
     out: List[dict] = []
     cur: Optional[dict] = None
-    for (ws, we, text), k in zip(words, who):
+    for n, ((ws, we, text), k) in enumerate(zip(words, who)):
         if cur is None or cur["speaker"] != k:
             if cur is not None:
                 out.append(cur)
@@ -458,7 +514,7 @@ def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.
         else:
             cur["text"] += " " + text
             cur["end"] = we
-        if text.endswith((".", "?", "!")) and not text.endswith("..."):
+        if _ends_sentence(text, words[n + 1][2] if n + 1 < len(words) else None):
             out.append(cur)
             cur = None
     if cur is not None:
@@ -553,21 +609,25 @@ def build_units(speech: List[Tuple[int, int]], turns: Optional[List[Tuple[float,
 class Recognizer:
     """One loaded speech-to-text model."""
 
-    def __init__(self, model_id: str, language: str, translate: bool, threads: int):
+    def __init__(self, model_id: str, threads: int, provider: str = "cpu"):
         so = _sherpa()
         spec = models.ASR[model_id]
         files = models.require(model_id)
         self.kind = spec["kind"]
         self.model_id = model_id
         if self.kind == "whisper":
+            # The language is fixed to English. Left to detect it, Whisper
+            # guesses afresh for every piece of audio, and on a short or
+            # noisy piece the guess can be anything - which is how a stray
+            # line of Welsh or Spanish turns up in an English meeting.
             self.rec = so.OfflineRecognizer.from_whisper(
                 encoder=files["encoder"], decoder=files["decoder"], tokens=files["tokens"],
-                language=language or "", task="translate" if translate else "transcribe",
-                num_threads=threads, enable_segment_timestamps=True)
+                language="en", task="transcribe", num_threads=threads, provider=provider,
+                enable_segment_timestamps=True)
         else:
             self.rec = so.OfflineRecognizer.from_transducer(
                 files["encoder"], files["decoder"], files["joiner"], files["tokens"],
-                num_threads=threads, provider="cpu", debug=False, decoding_method="greedy_search",
+                num_threads=threads, provider=provider, debug=False, decoding_method="greedy_search",
                 model_type="nemo_transducer")
 
     def run(self, samples: np.ndarray, offset: float) -> dict:
@@ -641,7 +701,37 @@ def _db(x: float) -> float:
 def transcribe(path: str, options: Options, emit: Optional[Callable[[dict], None]] = None,
                cancelled: Optional[Callable[[], bool]] = None, workdir: Optional[str] = None) -> dict:
     """Run the full pipeline on one file and return the transcript dict (see export.py)."""
-    emit = emit or (lambda _e: None)
+    own_tmp = None
+    if workdir is None:
+        own_tmp = tempfile.TemporaryDirectory(prefix="verbatim-", ignore_cleanup_errors=True)
+        workdir = own_tmp.name
+    failure: Optional[BaseException] = None
+    try:
+        return _transcribe(path, options, emit or (lambda _e: None), cancelled, workdir)
+    except BaseException as exc:  # noqa: BLE001 - re-raised below, once the frames are released
+        failure = exc
+    finally:
+        if failure is not None:
+            # A traceback keeps every frame it passed through alive, and those
+            # frames hold the memory-mapped audio. Windows will not delete a
+            # mapped file, so let go of them before cleaning up.
+            traceback.clear_frames(failure.__traceback__)
+        gc.collect()
+        for name in ("audio.f32", "clean.f32"):
+            try:
+                os.remove(os.path.join(workdir, name))
+            except OSError:
+                pass
+        if own_tmp is not None:
+            try:
+                own_tmp.cleanup()
+            except Exception:  # noqa: BLE001
+                pass
+    raise failure
+
+
+def _transcribe(path: str, options: Options, emit: Callable[[dict], None],
+                cancelled: Optional[Callable[[], bool]], workdir: str) -> dict:
     started = time.time()
     threads = options.threads or default_threads()
     spec = models.ASR[options.model]
@@ -651,6 +741,10 @@ def transcribe(path: str, options: Options, emit: Optional[Callable[[dict], None
     if absent:
         names = ", ".join(models.CATALOGUE[m]["label"] for m in absent)
         raise EngineError(f"Missing model{'s' if len(absent) > 1 else ''}: {names}. Use Models > Download.")
+    # Finding the speakers and transcribing do not depend on each other, so on
+    # a computer with cores to spare they run side by side.
+    parallel = options.speakers and (options.parallel == "on" or
+                                     (options.parallel == "auto" and (os.cpu_count() or 2) >= 6))
 
     # stage weights for the overall progress bar
     w = {"decode": 0.04, "speech": 0.05, "clean": 0.08 if want_denoise else 0.0,
@@ -659,243 +753,291 @@ def transcribe(path: str, options: Options, emit: Optional[Callable[[dict], None
     order = ["decode", "speech", "clean", "speakers", "text"]
     labels = {"decode": "Reading the audio", "speech": "Finding speech", "clean": "Reducing noise",
               "speakers": "Working out who spoke when", "text": "Transcribing"}
+    done = {name: 0.0 for name in order}
+    timings: Dict[str, float] = {}
+    lock = threading.Lock()
 
-    def stage(name: str):
-        base = sum(w[s] for s in order[:order.index(name)])
-
+    def stage(name: str, check: bool = True):
         def report(frac: float, detail: str = ""):
-            if cancelled and cancelled():
+            if check and cancelled and cancelled():
                 raise Cancelled()
-            emit({"type": "progress", "stage": name, "label": labels[name],
-                  "fraction": min(1.0, base + w[name] * max(0.0, min(1.0, frac))), "detail": detail})
+            with lock:
+                done[name] = max(done[name], max(0.0, min(1.0, frac)))
+                for earlier in order[:order.index(name)]:
+                    if not (parallel and earlier == "speakers" and name == "text"):
+                        done[earlier] = 1.0
+                total_frac = sum(w[s] * done[s] for s in order)
+                label = labels[name]
+                if parallel and name in ("speakers", "text") and done["speakers"] < 1.0:
+                    label = "Transcribing and working out who spoke when"
+                emit({"type": "progress", "stage": name, "label": label,
+                      "fraction": min(1.0, total_frac), "detail": detail})
         return report
 
     notes: List[str] = []
-    samples = work = listen = chunk = seg = None
-    own_tmp = None
-    if workdir is None:
-        own_tmp = tempfile.TemporaryDirectory(prefix="verbatim-", ignore_cleanup_errors=True)
-        workdir = own_tmp.name
     raw_path = os.path.join(workdir, "audio.f32")
     clean_path = os.path.join(workdir, "clean.f32")
+
+    # 1. decode
+    t0 = time.time()
+    rep = stage("decode")
+    rep(0.0)
+    info = audio.probe(path)
+    samples = audio.decode(path, raw_path, info.get("duration"), lambda f: rep(f), cancelled,
+                           highpass=want_denoise, notes=notes)
+    total = len(samples)
+    duration = total / RATE
+    if duration < 0.2:
+        raise EngineError(f"{os.path.basename(path)} holds no audio to speak of.")
+    timings["decode"] = time.time() - t0
+
+    # 2. speech detection
+    t0 = time.time()
+    rep = stage("speech")
+    rep(0.0)
+    vad_path = models.require("vad")["model"]
+    speech = detect_speech(samples, vad_path, options.filtering, threads, lambda f: rep(f), cancelled)
+    snr = audio.snr_db(samples, speech)
+    timings["speech"] = time.time() - t0
+
+    # 3. noise reduction. "Always" cleans even a file where no speech was found
+    #    the first time: the speech may be buried in the noise.
+    work = samples
+    cleaned = False
+    if want_denoise and (options.denoise == "on" or (speech and snr is not None and snr < AUTO_DENOISE_BELOW_DB)):
+        t0 = time.time()
+        rep = stage("clean")
+        rep(0.0)
+        work = reduce_noise(samples, models.require("denoise")["model"], clean_path, threads,
+                            lambda f: rep(f), cancelled)
+        cleaned = True
+        speech = detect_speech(work, vad_path, options.filtering, threads, None, cancelled)
+        if snr is not None and options.denoise == "auto" and snr >= 3:
+            notes.append(f"Noisy recording (speech about {snr:.0f} dB above the background): noise reduction applied.")
+        elif snr is not None and options.denoise == "auto":
+            notes.append("Very noisy recording (the speech is barely louder than the background): noise reduction "
+                         "applied. Expect more mistakes than usual.")
+        else:
+            notes.append("Noise reduction applied.")
+        timings["clean"] = time.time() - t0
+    speech_seconds = sum(e - s for s, e in speech) / RATE
+
+    result = {
+        "app": f"{paths.APP} {paths.VERSION}", "file": path, "duration": round(duration, 2),
+        "model": options.model, "language": "en", "options": asdict(options), "speakers": {},
+        "segments": [], "removed": [], "notes": notes,
+        "stats": {"speech_seconds": round(speech_seconds, 1), "snr_db": None if snr is None else round(snr, 1),
+                  "noise_reduction": cleaned, "threads": threads, "parallel": bool(parallel),
+                  "provider": options.provider, "timings": timings},
+    }
+    if not speech:
+        notes.append("No speech was found in this file.")
+        emit({"type": "progress", "stage": "text", "label": labels["text"], "fraction": 1.0, "detail": ""})
+        result["stats"]["seconds_taken"] = round(time.time() - started, 1)
+        return result
+
+    # 4. speakers - on its own thread when there are cores to spare
+    t_core = time.time()
+    provider = options.provider
+    diar: dict = {}
+
+    def find_speakers():
+        t = time.time()
+        try:
+            rep_s = stage("speakers", check=False)
+            rep_s(0.0)
+            seg_path = models.require("segmentation")["model"]
+            emb_path = models.require("embedding")["model"]
+            try:
+                diar["value"] = diarize(work, seg_path, emb_path, options.num_speakers, threads,
+                                        lambda f: rep_s(f), provider)
+            except Exception:  # noqa: BLE001
+                if provider == "cpu":
+                    raise
+                diar["value"] = diarize(work, seg_path, emb_path, options.num_speakers, threads,
+                                        lambda f: rep_s(f), "cpu")
+            rep_s(1.0)
+        except BaseException as exc:  # noqa: BLE001 - handed to the main thread
+            diar["error"] = exc
+        timings["speakers"] = time.time() - t
+
+    worker = None
+    if options.speakers:
+        if parallel:
+            worker = threading.Thread(target=find_speakers, name="speakers", daemon=True)
+            worker.start()
+        else:
+            find_speakers()
+            if "error" in diar:
+                raise diar["error"]
+
+    # 5. transcribe. The model is given whole stretches of speech, cut only at
+    #    pauses, and the text is shared out between the speakers afterwards from
+    #    its timestamps - word by word with Parakeet, phrase by phrase with
+    #    Whisper, which only times phrases. Cutting the audio itself at each
+    #    change of speaker would clip the words either side of the cut.
+    t0 = time.time()
+    rep = stage("text")
+    rep(0.0, "loading the model")
     try:
-        # 1. decode
-        rep = stage("decode")
-        rep(0.0)
-        info = audio.probe(path)
-        samples = audio.decode(path, raw_path, info.get("duration"), lambda f: rep(f), cancelled,
-                               highpass=want_denoise)
-        total = len(samples)
-        duration = total / RATE
-        if duration < 0.2:
-            raise EngineError(f"{os.path.basename(path)} holds no audio to speak of.")
+        rec = Recognizer(options.model, threads, provider)
+    except Exception:  # noqa: BLE001
+        if provider == "cpu":
+            raise
+        notes.append(f"The {provider} back end could not load the speech model; the processor was used instead.")
+        provider = "cpu"
+        rec = Recognizer(options.model, threads, "cpu")
+    timings["load"] = time.time() - t0
+    timed = spec["kind"] != "whisper"
+    units = build_units(speech, None, total, 1.0 if timed else 1.5)
+    listen = work if options.asr_audio == "cleaned" else samples
+    pad = int(PAD * RATE)
+    # loudness of each unit against the typical unit, for the phantom-phrase check
+    levels = []
+    for u in units:
+        seg = np.asarray(work[u["start"]:u["end"]], dtype=np.float32)
+        levels.append(_db(float(np.mean(seg.astype(np.float64) ** 2)) if len(seg) else 0.0))
+    typical = float(np.median(levels)) if levels else 0.0
+    done_audio = 0
+    all_audio = sum(u["end"] - u["start"] for u in units) or 1
+    decoded: List[Tuple[dict, float, dict]] = []
+    for i, (u, lvl) in enumerate(zip(units, levels)):
+        if cancelled and cancelled():
+            raise Cancelled()
+        if "error" in diar:
+            raise diar["error"]
+        # a little context either side, but never past the middle of the
+        # pause that separates this unit from its neighbour
+        before = u["start"] - (units[i - 1]["end"] if i else 0)
+        after = (units[i + 1]["start"] if i + 1 < len(units) else total) - u["end"]
+        a = max(0, u["start"] - max(min(pad, before // 2), 0))
+        b = min(total, u["end"] + max(min(pad, after // 2), 0))
+        out = rec.run(np.ascontiguousarray(listen[a:b], dtype=np.float32), a / RATE)
+        decoded.append((u, lvl, out))
+        done_audio += u["end"] - u["start"]
+        rep(done_audio / all_audio, f"{export_clock(u['end'] / RATE)} of {export_clock(duration)}")
+    del rec
+    timings["text"] = time.time() - t0 - timings["load"]
 
-        # 2. speech detection
-        rep = stage("speech")
-        rep(0.0)
-        vad_path = models.require("vad")["model"]
-        speech = detect_speech(samples, vad_path, options.filtering, threads, lambda f: rep(f), cancelled)
-        snr = audio.snr_db(samples, speech)
-
-        # 3. noise reduction
-        work = samples
-        cleaned = False
-        if speech and want_denoise and (options.denoise == "on" or (snr is not None and snr < AUTO_DENOISE_BELOW_DB)):
-            rep = stage("clean")
-            rep(0.0)
-            work = reduce_noise(samples, models.require("denoise")["model"], clean_path, threads,
-                                lambda f: rep(f), cancelled)
-            cleaned = True
-            speech = detect_speech(work, vad_path, options.filtering, threads, None, cancelled)
-            if snr is not None:
-                notes.append(f"Noisy recording (speech about {snr:.0f} dB above the background): noise reduction applied.")
-            else:
-                notes.append("Noise reduction applied.")
-        speech_seconds = sum(e - s for s, e in speech) / RATE
-
-        result = {
-            "app": f"{paths.APP} {paths.VERSION}", "file": path, "duration": round(duration, 2),
-            "model": options.model, "language": "", "options": asdict(options), "speakers": {},
-            "segments": [], "removed": [], "notes": notes,
-            "stats": {"speech_seconds": round(speech_seconds, 1), "snr_db": None if snr is None else round(snr, 1),
-                      "noise_reduction": cleaned},
-        }
-        if not speech:
-            notes.append("No speech was found in this file.")
-            emit({"type": "progress", "stage": "text", "label": labels["text"], "fraction": 1.0, "detail": ""})
-            result["stats"]["seconds_taken"] = round(time.time() - started, 1)
-            return result
-
-        # 4. speakers
-        turns = None
-        if options.speakers:
-            rep = stage("speakers")
-            rep(0.0)
-            turns, folded = diarize(work, models.require("segmentation")["model"],
-                                    models.require("embedding")["model"], options.num_speakers, threads,
-                                    lambda f: rep(f))
-            if folded:
-                notes.append(f"{folded} stray voice{'s' if folded != 1 else ''} with only a moment of audio "
-                             f"{'were' if folded != 1 else 'was'} merged into the speaker "
-                             f"{'they' if folded != 1 else 'it'} sounded most like.")
-            rep(1.0)
-
-        # 5. transcribe
-        rep = stage("text")
-        rep(0.0, "loading the model")
-        rec = Recognizer(options.model, options.language, options.translate, threads)
-        # The model is given whole stretches of speech, cut only at pauses, and
-        # the text is shared out between the speakers afterwards from its
-        # timestamps - word by word with Parakeet, phrase by phrase with
-        # Whisper, which only times phrases. Cutting the audio itself at each
-        # change of speaker would clip the words either side of the cut.
-        timed = spec["kind"] != "whisper"
-        units = build_units(speech, None, total, 1.0 if timed else 1.5)
-        label = speaker_frames(turns, total) if turns else None
-
-        def majority(start: float, end: float) -> Optional[int]:
-            if label is None:
-                return None
-            a_ = max(0, min(len(label) - 1, int(start * 100)))
-            frames = label[a_:max(a_ + 1, min(len(label), int(end * 100) + 1))]
-            frames = frames[frames >= 0]
-            if not len(frames):
-                return None
-            vals, counts = np.unique(frames, return_counts=True)
-            return int(vals[np.argmax(counts)])
-
-        listen = work if options.asr_audio == "cleaned" else samples
-        pad = int(PAD * RATE)
-        locked = options.language
-        if spec["kind"] == "whisper" and not options.language and not options.translate and len(units) > 1:
-            # Whisper guesses the language afresh for every piece it is given,
-            # and on a short or noisy piece the guess can be anything - which
-            # is how a stray line of Welsh or Spanish ends up in an English
-            # meeting. Decide once, from the three longest stretches of
-            # speech, and hold the whole file to it.
-            votes: Dict[str, float] = {}
-            for u in sorted(units, key=lambda u: u["start"] - u["end"])[:3]:
-                a, b = max(0, u["start"] - pad), min(total, u["end"] + pad)
-                lang = rec.run(np.ascontiguousarray(listen[a:b], dtype=np.float32), a / RATE)["language"]
-                if lang:
-                    votes[lang] = votes.get(lang, 0.0) + (b - a)
-            if votes:
-                locked = max(votes, key=votes.get)
-                rec = Recognizer(options.model, locked, False, threads)
-        # loudness of each unit against the typical unit, for the phantom-phrase check
-        levels = []
-        for u in units:
-            seg = np.asarray(work[u["start"]:u["end"]], dtype=np.float32)
-            levels.append(_db(float(np.mean(seg.astype(np.float64) ** 2)) if len(seg) else 0.0))
-        typical = float(np.median(levels)) if levels else 0.0
-        done_audio = 0
-        all_audio = sum(u["end"] - u["start"] for u in units) or 1
-        langs: Dict[str, float] = {}
-        segments: List[dict] = []
-        for i, (u, lvl) in enumerate(zip(units, levels)):
+    turns = None
+    if worker is not None:
+        while worker.is_alive():
+            worker.join(0.25)
             if cancelled and cancelled():
                 raise Cancelled()
-            # a little context either side, but never past the middle of the
-            # pause that separates this unit from its neighbour
-            before = u["start"] - (units[i - 1]["end"] if i else 0)
-            after = (units[i + 1]["start"] if i + 1 < len(units) else total) - u["end"]
-            a = max(0, u["start"] - max(min(pad, before // 2), 0))
-            b = min(total, u["end"] + max(min(pad, after // 2), 0))
-            chunk = np.ascontiguousarray(listen[a:b], dtype=np.float32)
-            out = rec.run(chunk, a / RATE)
-            length = (u["end"] - u["start"]) / RATE
-            if out["language"]:
-                langs[out["language"]] = langs.get(out["language"], 0.0) + length
-            kept, reason = filters.judge(out["text"], length, out["confidence"], options.filtering, lvl - typical)
-            if not kept:
-                if out["text"]:
-                    result["removed"].append({"start": round(u["start"] / RATE, 2), "end": round(u["end"] / RATE, 2),
-                                              "text": out["text"], "reason": reason or "empty"})
-            else:
-                # stripping a [Music] tag leaves the model's own timing usable; a
-                # collapsed loop does not, and becomes one piece
-                intact = kept == out["text"] or reason == "non-speech markers removed"
-                if reason and not intact:
-                    result["removed"].append({"start": round(u["start"] / RATE, 2), "end": round(u["end"] / RATE, 2),
-                                              "text": out["text"], "reason": reason, "kept_as": kept})
-                conf = None if out["confidence"] is None else round(out["confidence"], 3)
-                if timed and out["words"] and intact:
-                    for seg_ in words_to_segments(out["words"], label):
-                        segments.append({"start": round(seg_["start"], 2), "end": round(seg_["end"], 2),
-                                         "speaker": seg_["speaker"], "text": seg_["text"], "confidence": conf})
-                else:
-                    parts = out["parts"] if intact else [(u["start"] / RATE, u["end"] / RATE, kept)]
-                    for ps, pe, pt in parts:
-                        if options.filtering != "off":
-                            why = filters.phantom(pt, options.filtering) if len(parts) > 1 else None
-                            if why:
-                                result["removed"].append({"start": round(ps, 2), "end": round(pe, 2), "text": pt,
-                                                          "reason": why})
-                                continue
-                            pt = filters.strip_tags(pt)
-                        if not pt:
-                            continue
-                        ps = max(u["start"] / RATE - PAD, min(ps, u["end"] / RATE))
-                        pe = max(ps + 0.05, min(pe, u["end"] / RATE + PAD))
-                        who = majority(ps, pe)
-                        if who is None:
-                            who = majority(u["start"] / RATE, u["end"] / RATE)
-                        segments.append({"start": round(ps, 2), "end": round(pe, 2), "speaker": who, "text": pt,
-                                         "confidence": conf})
-            done_audio += u["end"] - u["start"]
-            rep(done_audio / all_audio, f"{export_clock(u['end'] / RATE)} of {export_clock(duration)}")
+    if "error" in diar:
+        raise diar["error"]
+    timings["core"] = time.time() - t_core   # speakers + loading the model + transcribing, as the clock saw it
+    if options.speakers:
+        turns, folded = diar["value"]
+        if folded:
+            notes.append(f"{folded} stray voice{'s' if folded != 1 else ''} with only a moment of audio "
+                         f"{'were' if folded != 1 else 'was'} merged into the speaker "
+                         f"{'they' if folded != 1 else 'it'} sounded most like.")
+    label = speaker_frames(turns, total) if turns else None
 
-        # 6. name the speakers in order of first appearance
-        if options.speakers:
-            order_seen: List[int] = []
-            for s in segments:
-                if s["speaker"] is not None and s["speaker"] not in order_seen:
-                    order_seen.append(s["speaker"])
-            ids = {k: f"S{i + 1}" for i, k in enumerate(order_seen)}
-            last = None
-            for s in segments:
-                if s["speaker"] is None:
-                    s["speaker"] = last
-                else:
-                    s["speaker"] = ids[s["speaker"]]
-                    last = s["speaker"]
-            first = next((s["speaker"] for s in segments if s["speaker"]), None)
-            for s in segments:
-                if s["speaker"] is None:
-                    s["speaker"] = first
-            result["speakers"] = {v: f"Speaker {i + 1}" for i, v in enumerate(ids.values())}
+    def majority(start: float, end: float) -> Optional[int]:
+        if label is None:
+            return None
+        a_ = max(0, min(len(label) - 1, int(start * 100)))
+        frames = label[a_:max(a_ + 1, min(len(label), int(end * 100) + 1))]
+        frames = frames[frames >= 0]
+        if not len(frames):
+            return None
+        vals, counts = np.unique(frames, return_counts=True)
+        return int(vals[np.argmax(counts)])
+
+    # 6. check each piece of text, then share it out between the speakers
+    segments: List[dict] = []
+    gaps = []
+    for i, (u, _lvl, _out) in enumerate(decoded):
+        before = (u["start"] - (decoded[i - 1][0]["end"] if i else 0)) / RATE
+        after = ((decoded[i + 1][0]["start"] if i + 1 < len(decoded) else total) - u["end"]) / RATE
+        if len(decoded) == 1:
+            gaps.append(0.0)            # the only speech in the file: nothing to be isolated from
+        elif i == 0:
+            gaps.append(after)
+        elif i == len(decoded) - 1:
+            gaps.append(before)
         else:
-            for s in segments:
-                s["speaker"] = None
-        result["segments"] = segments
-        if spec["kind"] == "whisper":
-            result["language"] = locked or (max(langs, key=langs.get) if langs else "")
-            if options.translate:
-                result["language"] = (result["language"] + " > en").strip()
-        elif options.model == "parakeet-v2":
-            result["language"] = "en"
-        dropped = [r for r in result["removed"] if "kept_as" not in r]
-        if dropped:
-            notes.append(f"{len(dropped)} piece{'s' if len(dropped) != 1 else ''} of doubtful text "
-                         f"{'were' if len(dropped) != 1 else 'was'} left out (listed under Removed).")
-        result["stats"]["seconds_taken"] = round(time.time() - started, 1)
-        result["stats"]["words"] = sum(len(s["text"].split()) for s in segments)
-        return result
-    finally:
-        # Windows will not delete a file that is still memory-mapped, and a
-        # slice of a memory map keeps the whole map alive: drop every reference.
-        samples = work = listen = chunk = seg = None  # noqa: F841
-        gc.collect()
-        for p in (raw_path, clean_path):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        if own_tmp is not None:
-            try:
-                own_tmp.cleanup()
-            except Exception:  # noqa: BLE001
-                pass
+            gaps.append(min(before, after))
+    for (u, lvl, out), gap in zip(decoded, gaps):
+        length = (u["end"] - u["start"]) / RATE
+        us, ue = u["start"] / RATE, u["end"] / RATE
+        kept, reason = filters.judge(out["text"], length, out["confidence"], options.filtering, lvl - typical,
+                                     isolated=gap >= 2.0)
+        if not kept:
+            if out["text"]:
+                result["removed"].append({"start": round(us, 2), "end": round(ue, 2), "text": out["text"],
+                                          "reason": reason or "empty"})
+            continue
+        # stripping a [Music] tag leaves the model's own timing usable; a
+        # collapsed loop does not, and becomes one piece
+        intact = kept == out["text"] or reason == "non-speech markers removed"
+        if reason and not intact:
+            result["removed"].append({"start": round(us, 2), "end": round(ue, 2), "text": out["text"],
+                                      "reason": reason, "kept_as": kept})
+        conf = None if out["confidence"] is None else round(out["confidence"], 3)
+        if timed and out["words"] and intact:
+            words = out["words"]
+            if options.filtering != "off":
+                words = [(ws, we, filters.strip_tags(wt)) for ws, we, wt in words]
+                words = [x for x in words if x[2]]
+            for seg_ in words_to_segments(words, label):
+                segments.append({"start": round(seg_["start"], 2), "end": round(seg_["end"], 2),
+                                 "speaker": seg_["speaker"], "text": seg_["text"], "confidence": conf})
+            continue
+        parts = out["parts"] if intact else [(us, min(ue, us + max(2.0, len(kept) / 12.0)), kept)]
+        for ps, pe, pt in parts:
+            if options.filtering != "off":
+                why = filters.phantom(pt, options.filtering, isolated=gap >= 2.0) if len(parts) > 1 else None
+                if why:
+                    result["removed"].append({"start": round(ps, 2), "end": round(pe, 2), "text": pt, "reason": why})
+                    continue
+                pt = filters.strip_tags(pt)
+            if not pt:
+                continue
+            ps = max(us - PAD, min(ps, ue))
+            pe = max(ps + 0.05, min(pe, ue + PAD))
+            who = majority(ps, pe)
+            if who is None:
+                who = majority(us, ue)
+            segments.append({"start": round(ps, 2), "end": round(pe, 2), "speaker": who, "text": pt,
+                             "confidence": conf})
+
+    # 7. name the speakers in order of first appearance
+    if options.speakers:
+        order_seen: List[int] = []
+        for s in segments:
+            if s["speaker"] is not None and s["speaker"] not in order_seen:
+                order_seen.append(s["speaker"])
+        ids = {k: f"S{i + 1}" for i, k in enumerate(order_seen)}
+        last = None
+        for s in segments:
+            if s["speaker"] is None:
+                s["speaker"] = last
+            else:
+                s["speaker"] = ids[s["speaker"]]
+                last = s["speaker"]
+        first = next((s["speaker"] for s in segments if s["speaker"]), None)
+        for s in segments:
+            if s["speaker"] is None:
+                s["speaker"] = first
+        result["speakers"] = {v: f"Speaker {i + 1}" for i, v in enumerate(ids.values())}
+    else:
+        for s in segments:
+            s["speaker"] = None
+    result["segments"] = segments
+    dropped = [r for r in result["removed"] if "kept_as" not in r]
+    if dropped:
+        notes.append(f"{len(dropped)} piece{'s' if len(dropped) != 1 else ''} of doubtful text "
+                     f"{'were' if len(dropped) != 1 else 'was'} left out (listed under Removed).")
+    result["stats"]["provider"] = provider
+    result["stats"]["timings"] = {k: round(v, 1) for k, v in timings.items()}
+    result["stats"]["seconds_taken"] = round(time.time() - started, 1)
+    result["stats"]["words"] = sum(len(s["text"].split()) for s in segments)
+    emit({"type": "progress", "stage": "text", "label": labels["text"], "fraction": 1.0, "detail": ""})
+    return result
 
 
 def export_clock(seconds: float) -> str:

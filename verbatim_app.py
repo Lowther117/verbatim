@@ -10,6 +10,7 @@ be silent.
   Verbatim selftest              run the self-test, write verbatim-selftest.txt, exit
   Verbatim engine --job FILE     one transcription job (the window starts these itself)
   Verbatim transcribe ...        command-line transcription (see --help)
+  Verbatim speedtest             time this computer and choose the fastest way to run
 """
 import multiprocessing
 import os
@@ -17,7 +18,7 @@ import sys
 import traceback
 
 
-_HEADLESS = ("engine", "selftest", "transcribe", "fetch", "models")
+_HEADLESS = ("engine", "selftest", "transcribe", "fetch", "models", "speedtest", "-h", "--help", "help", "-V", "--version")
 
 
 def _app_dir():
@@ -29,6 +30,20 @@ def _app_dir():
                 return os.sep.join(parts[:i]) or os.sep
         return os.path.dirname(exe)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def _attach_console():
+    """Windows: a windowed build has no console, so "Verbatim.exe transcribe ..."
+    typed at a prompt would print nothing. Borrow the console it was typed in."""
+    if not sys.platform.startswith("win") or sys.stdout is not None:
+        return
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.AttachConsole(-1):   # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 
 def _fix_streams():
@@ -78,6 +93,8 @@ def _crash(exc, dialog=True):
 
 def main():
     multiprocessing.freeze_support()
+    if len(sys.argv) > 1 and sys.argv[1] in _HEADLESS and sys.argv[1] not in ("engine", "selftest"):
+        _attach_console()
     _fix_streams()
     # Finder passes -psn_0_12345 to a bundle; a strict parser would exit(2)
     # here and the window would never appear.

@@ -6,7 +6,7 @@ import os
 import sys
 
 APP = "Verbatim"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SETTINGS_NAME = "verbatim-settings.json"
 MODELS_NAME = "verbatim-models"
 
@@ -28,9 +28,51 @@ def resource_dir() -> str:
     return getattr(sys, "_MEIPASS", app_dir())
 
 
+_DATA_DIR = None
+
+
+def data_dir() -> str:
+    """Where settings, downloaded models and logs are kept.
+
+    Beside the app when that folder can be written to - the house rule, and
+    it keeps everything in one place. An app sitting in /Applications or
+    Program Files usually cannot write there, so the per-user application
+    data folder is used instead.
+    """
+    global _DATA_DIR
+    if _DATA_DIR:
+        return _DATA_DIR
+    here = app_dir()
+    probe = os.path.join(here, f".verbatim-write-test-{os.getpid()}")
+    try:
+        with open(probe, "w") as fh:
+            fh.write("x")
+        os.remove(probe)
+        _DATA_DIR = here
+        return here
+    except OSError:
+        pass
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    fallback = os.path.join(base, APP)
+    try:
+        os.makedirs(fallback, exist_ok=True)
+        _DATA_DIR = fallback
+    except OSError:
+        _DATA_DIR = here
+    return _DATA_DIR
+
+
 def models_dirs() -> list:
     """Every folder a model may be in. The first one is where downloads go."""
-    out = [os.path.join(app_dir(), MODELS_NAME)]
+    out = [os.path.join(data_dir(), MODELS_NAME)]
+    beside = os.path.join(app_dir(), MODELS_NAME)
+    if beside not in out:
+        out.append(beside)
     env = os.environ.get("VERBATIM_MODELS")
     if env:
         out.insert(0, env)
@@ -41,7 +83,7 @@ def models_dirs() -> list:
 
 
 def settings_path() -> str:
-    return os.path.join(app_dir(), SETTINGS_NAME)
+    return os.path.join(data_dir(), SETTINGS_NAME)
 
 
 def load_settings() -> dict:

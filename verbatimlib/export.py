@@ -57,9 +57,13 @@ def speaker_name(t: dict, sid: Optional[str]) -> str:
 
 
 def paragraphs(t: dict, gap: float = 2.5, max_chars: int = 1200) -> List[dict]:
-    """Consecutive segments from one speaker, joined into readable paragraphs."""
+    """Consecutive segments from one speaker, joined into readable paragraphs.
+
+    Each paragraph carries "segments": the indices of the segments it was made
+    from, so the window can change the speaker of exactly that paragraph.
+    """
     out: List[dict] = []
-    for seg in t.get("segments", []):
+    for n, seg in enumerate(t.get("segments", [])):
         text = seg["text"].strip()
         if not text:
             continue
@@ -68,8 +72,10 @@ def paragraphs(t: dict, gap: float = 2.5, max_chars: int = 1200) -> List[dict]:
                 and seg["start"] - last["end"] <= gap and len(last["text"]) + len(text) < max_chars):
             last["text"] += " " + text
             last["end"] = seg["end"]
+            last["segments"].append(n)
         else:
-            out.append({"start": seg["start"], "end": seg["end"], "speaker": seg.get("speaker"), "text": text})
+            out.append({"start": seg["start"], "end": seg["end"], "speaker": seg.get("speaker"), "text": text,
+                        "segments": [n]})
     return out
 
 
@@ -131,8 +137,10 @@ def cues(t: dict, max_chars: int = 84, max_seconds: float = 7.0) -> List[dict]:
             continue
         start, end = seg["start"], max(seg["end"], seg["start"] + 0.3)
         pieces = max(1, -(-len(text) // max_chars), int(-(-(end - start) // max_seconds)))
-        if pieces == 1:
-            out.append({"start": start, "end": end, "speaker": seg.get("speaker"), "text": text})
+        if pieces == 1 or len(text.split(" ")) == 1:
+            # a short line must not sit on screen for the whole of a long gap
+            out.append({"start": start, "end": min(end, start + max_seconds), "speaker": seg.get("speaker"),
+                        "text": text})
             continue
         words = text.split(" ")
         target = len(text) / pieces
@@ -149,7 +157,7 @@ def cues(t: dict, max_chars: int = 84, max_seconds: float = 7.0) -> List[dict]:
         pos = start
         for c in chunks:
             span = (end - start) * len(c) / total
-            out.append({"start": pos, "end": pos + span, "speaker": seg.get("speaker"), "text": c})
+            out.append({"start": pos, "end": pos + min(span, max_seconds), "speaker": seg.get("speaker"), "text": c})
             pos += span
     return out
 
@@ -170,9 +178,7 @@ def to_srt(t: dict) -> str:
     out = []
     for i, c in enumerate(cues(t), 1):
         who = speaker_name(t, c["speaker"])
-        text = _wrap(c["text"])
-        if who:
-            text = f"{who}: {text}"
+        text = _wrap(f"{who}: {c['text']}" if who else c["text"])
         out.append(f"{i}\n{_stamp(c['start'], ',')} --> {_stamp(c['end'], ',')}\n{text}\n")
     return "\n".join(out)
 
@@ -192,10 +198,14 @@ def to_csv(t: dict) -> str:
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\r\n")
     w.writerow(["start", "end", "start_seconds", "end_seconds", "speaker", "text", "confidence"])
+    def cell(value: str) -> str:
+        # a spreadsheet treats a cell starting with = + - @ as a formula
+        return "'" + value if value[:1] in ("=", "+", "-", "@") else value
+
     for s in t.get("segments", []):
         conf = s.get("confidence")
         w.writerow([clock(s["start"], True), clock(s["end"], True), f"{s['start']:.2f}", f"{s['end']:.2f}",
-                    speaker_name(t, s.get("speaker")), s["text"], "" if conf is None else f"{conf:.2f}"])
+                    cell(speaker_name(t, s.get("speaker"))), cell(s["text"]), "" if conf is None else f"{conf:.2f}"])
     return buf.getvalue()
 
 
@@ -218,7 +228,7 @@ def _run(text: str, bold: bool = False, size: int = 22, colour: Optional[str] = 
     if colour:
         props += f'<w:color w:val="{colour}"/>'
     props += f'<w:sz w:val="{size}"/><w:szCs w:val="{size}"/>'
-    text = escape(_BAD_XML.sub("", text))
+    text = escape(_BAD_XML.sub("", text.encode("utf-8", "replace").decode("utf-8")))
     return f'<w:r><w:rPr>{props}</w:rPr><w:t xml:space="preserve">{text}</w:t></w:r>'
 
 
@@ -264,34 +274,38 @@ def to_docx_bytes(t: dict, timestamps: bool = True) -> bytes:
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("[Content_Types].xml", types)
         z.writestr("_rels/.rels", rels)
-        z.writestr("word/document.xml", document)
+        z.writestr("word/document.xml", document.encode("utf-8", "replace"))
     return buf.getvalue()
 
 
 # --- files --------------------------------------------------------------------
 
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
 
 
 def safe_stem(path: str) -> str:
     stem = os.path.splitext(os.path.basename(path))[0]
     stem = _UNSAFE.sub("_", stem).strip(" .")
+    stem = stem.encode("utf-8", "replace").decode("utf-8")   # a name with undecodable bytes
+    if stem.split(".")[0].upper() in _RESERVED:
+        stem += "_"
     return stem[:120] or "transcript"
 
 
 def render(t: dict, fmt: str, timestamps: bool = True) -> bytes:
     if fmt == "txt":
-        return to_txt(t, timestamps).encode("utf-8")
+        return to_txt(t, timestamps).encode("utf-8", "replace")
     if fmt == "md":
-        return to_md(t, timestamps).encode("utf-8")
+        return to_md(t, timestamps).encode("utf-8", "replace")
     if fmt == "srt":
-        return to_srt(t).encode("utf-8")
+        return to_srt(t).encode("utf-8", "replace")
     if fmt == "vtt":
-        return to_vtt(t).encode("utf-8")
+        return to_vtt(t).encode("utf-8", "replace")
     if fmt == "csv":
         return ("﻿" + to_csv(t)).encode("utf-8")  # BOM so Excel reads it as UTF-8
     if fmt == "json":
-        return to_json(t).encode("utf-8")
+        return to_json(t).encode("utf-8", "replace")
     if fmt == "docx":
         return to_docx_bytes(t, timestamps)
     raise ValueError(f"unknown format {fmt}")

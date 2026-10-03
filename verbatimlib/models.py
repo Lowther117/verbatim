@@ -30,43 +30,31 @@ class ModelError(Exception):
 
 def _whisper(name: str, label: str, mb: int, blurb: str, speed: str) -> dict:
     return {
-        "kind": "whisper", "label": label, "mb": mb, "blurb": blurb, "speed": speed, "languages": "99 languages",
+        "kind": "whisper", "label": label, "mb": mb, "blurb": blurb, "speed": speed,
         "url": f"{_REL}/asr-models/sherpa-onnx-whisper-{name}.tar.bz2",
         "files": {"encoder": f"{name}-encoder.int8.onnx", "decoder": f"{name}-decoder.int8.onnx",
                   "tokens": f"{name}-tokens.txt"},
     }
 
 
-# Speech-to-text models, in the order the picker shows them.
+# Speech-to-text models, in the order the picker shows them. English only: the
+# Whisper models are multilingual but are held to English here.
 ASR: Dict[str, dict] = {
     "parakeet-v2": {
-        "kind": "transducer", "label": "Parakeet v2 - English (recommended)", "mb": 630, "speed": "fast",
-        "languages": "English only",
-        "blurb": "The most accurate English model here and the least prone to inventing words. "
-                 "Punctuation and capitals included. English only.",
+        "kind": "transducer", "label": "Parakeet v2 (recommended)", "mb": 630, "speed": "fast",
+        "blurb": "The most accurate of the three and the least prone to inventing words. It times every word, "
+                 "which is what lets a sentence be split cleanly between two speakers.",
         "url": f"{_REL}/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
         "files": {"encoder": "encoder.int8.onnx", "decoder": "decoder.int8.onnx", "joiner": "joiner.int8.onnx",
                   "tokens": "tokens.txt"},
     },
-    "parakeet-v3": {
-        "kind": "transducer", "label": "Parakeet v3 - 25 European languages", "mb": 640, "speed": "fast",
-        "languages": "25 European languages, detected automatically",
-        "blurb": "Same family as v2 but multilingual: English, French, German, Spanish, Italian, Dutch, Polish, "
-                 "Portuguese, Russian, Ukrainian and 15 more. Not Welsh - use a Whisper model for that.",
-        "url": f"{_REL}/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
-        "files": {"encoder": "encoder.int8.onnx", "decoder": "decoder.int8.onnx", "joiner": "joiner.int8.onnx",
-                  "tokens": "tokens.txt"},
-    },
-    "whisper-turbo": _whisper("turbo", "Whisper large-v3 turbo - any language, best quality", 1040,
-                              "OpenAI's large model, 99 languages including Welsh. The most accurate "
-                              "multilingual choice; noticeably slower without a fast processor.", "slow"),
-    "whisper-small": _whisper("small", "Whisper small - any language, balanced", 360,
-                              "99 languages including Welsh. A reasonable middle ground for other languages "
-                              "on an ordinary laptop.", "medium"),
-    "whisper-base": _whisper("base", "Whisper base - any language, quick draft", 155,
-                             "Quick and light. Fine for clear recordings, shaky on accents and crosstalk.", "fast"),
-    "whisper-tiny": _whisper("tiny", "Whisper tiny - any language, fastest", 100,
-                             "The smallest model. For a rough gist only.", "very fast"),
+    "whisper-turbo": _whisper("turbo", "Whisper large-v3 turbo (second opinion)", 1040,
+                              "OpenAI's large model. Worth a second run on a recording Parakeet struggled with - "
+                              "heavy accents, unusual names. Two to three times slower, and more inclined to "
+                              "invent text over noise.", "slow"),
+    "whisper-small": _whisper("small", "Whisper small (lighter second opinion)", 360,
+                              "A smaller Whisper for a computer short on memory. Less accurate than the other two.",
+                              "medium"),
 }
 
 # Supporting models. Small, and always baked into a build.
@@ -94,19 +82,6 @@ SUPPORT: Dict[str, dict] = {
 
 CATALOGUE: Dict[str, dict] = {**ASR, **SUPPORT}
 DEFAULT_ASR = "parakeet-v2"
-
-# Whisper language codes offered in the picker ("" = detect). Anything Whisper
-# knows can still be typed into the settings file.
-LANGUAGES = [
-    ("", "Detect automatically"), ("en", "English"), ("cy", "Welsh"), ("fr", "French"), ("de", "German"),
-    ("es", "Spanish"), ("it", "Italian"), ("pt", "Portuguese"), ("nl", "Dutch"), ("pl", "Polish"),
-    ("ro", "Romanian"), ("sv", "Swedish"), ("da", "Danish"), ("no", "Norwegian"),
-    ("fi", "Finnish"), ("cs", "Czech"), ("el", "Greek"), ("hu", "Hungarian"), ("tr", "Turkish"),
-    ("uk", "Ukrainian"), ("ru", "Russian"), ("ar", "Arabic"), ("he", "Hebrew"), ("hi", "Hindi"),
-    ("ur", "Urdu"), ("bn", "Bengali"), ("pa", "Punjabi"), ("zh", "Chinese"), ("ja", "Japanese"),
-    ("ko", "Korean"), ("vi", "Vietnamese"), ("th", "Thai"), ("id", "Indonesian"),
-]
-
 
 def find(model_id: str) -> Optional[Dict[str, str]]:
     """{role: absolute path} if every file of the model is on disk, else None."""
@@ -252,6 +227,13 @@ def install(model_id: str, progress: Optional[Callable[[str, int, int], None]] =
                         progress("unpack", done, len(names))
                     if done == len(names):
                         break
+        except ModelError:   # cancelled while unpacking: do not leave a gigabyte archive behind
+            for leftover in [target] + [os.path.join(folder, n + ".part") for n in names]:
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            raise
         except (tarfile.TarError, EOFError, OSError) as exc:
             try:
                 os.remove(target)

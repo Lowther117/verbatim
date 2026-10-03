@@ -112,13 +112,15 @@ def _friendly(stderr: str, path: str) -> str:
 def decode(path: str, raw_path: str, duration: Optional[float] = None,
            progress: Optional[Callable[[float], None]] = None,
            cancelled: Optional[Callable[[], bool]] = None,
-           highpass: bool = True) -> np.ndarray:
+           highpass: bool = True, notes: Optional[list] = None) -> np.ndarray:
     """Decode the first audio stream of `path` to 16 kHz mono float32 in `raw_path`.
 
     Returns a read-only memory map, so a three-hour recording does not need
     three hours of samples in RAM just to be opened. `highpass` removes
     sub-speech rumble (mains hum, handling noise, wind) below 70 Hz, which
-    carries no speech at all and only confuses the speech detector.
+    carries no speech at all and only confuses the speech detector. If ffmpeg
+    reports a fault part-way through (a damaged or cut-off file) the audio it
+    did recover is still returned, and a line saying so is added to `notes`.
     """
     if not os.path.isfile(path):
         raise AudioError(f"{os.path.basename(path)} could not be found - was it moved or renamed?")
@@ -153,6 +155,10 @@ def decode(path: str, raw_path: str, duration: Optional[float] = None,
     size = os.path.getsize(raw_path) if os.path.exists(raw_path) else 0
     if size < 4 * 160:  # under 10 ms of audio: nothing usable came out
         raise AudioError(_friendly(stderr, path))
+    if proc.returncode != 0 and notes is not None:
+        got = size / 4 / RATE
+        notes.append(f"This file is damaged or incomplete: only the first {int(got // 60)} min {int(got % 60)} s "
+                     f"could be read, and that is what was transcribed.")
     if progress:
         progress(1.0)
     return np.memmap(raw_path, dtype=np.float32, mode="r", shape=(size // 4,))
@@ -187,8 +193,10 @@ def snr_db(samples: np.ndarray, speech: list) -> Optional[float]:
 
     `speech` is a list of (start_sample, end_sample). The background is the
     median power of the frames that are well clear of any speech (a 0.3 s
-    guard either side, so the tails of words do not count as noise); when a
-    recording has no such gaps, the quietest frames stand in. Returns None
+    guard either side, so the tails of words do not count as noise), capped by
+    the quietest moments of the whole file so that applause in the gaps is not
+    taken for a steady background; when a recording has no gaps at all, the
+    quietest frames stand in. Returns None
     when there is no speech and 99 when the background is digitally silent.
     """
     power = frame_power(samples)
@@ -205,13 +213,18 @@ def snr_db(samples: np.ndarray, speech: list) -> Optional[float]:
     if len(sp) == 0:
         return None
     rest = power[~near]
+    floor = float(np.percentile(power, 8))   # the quietest moments anywhere, pauses between words included
     if len(rest) >= 50:  # at least a second of clear background to measure
-        noise = float(np.median(rest))
+        # Whichever is lower: applause or laughter in the gaps is loud but is
+        # not a steady background, and must not read as a noisy recording.
+        noise = min(float(np.median(rest)), max(floor, 1e-12) * 4.0) if floor > 1e-11 else float(np.median(rest))
     else:
-        noise = float(np.percentile(power, 5))
+        noise = floor
     signal = float(np.mean(sp))
     if signal <= 0:
         return None
     if noise <= 1e-11:
         return 99.0
-    return float(min(99.0, 10.0 * np.log10(max(signal - noise, 1e-12) / noise)))
+    if signal <= noise * 1.05:  # the "speech" is no louder than the background: call it 0 dB, not minus infinity
+        return float(max(-20.0, 10.0 * np.log10(signal / noise)))
+    return float(min(99.0, 10.0 * np.log10((signal - noise) / noise)))

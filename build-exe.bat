@@ -12,6 +12,12 @@ REM
 REM  Which speech model is baked in:  set VERBATIM_BAKE=parakeet-v2  (default)
 REM  Any id from "verbatim models" works; "none" bakes only the small helper
 REM  models and the app downloads a speech model on first use instead.
+REM
+REM  NVIDIA graphics card (experimental, not tested by the author):
+REM      set VERBATIM_GPU=cuda
+REM  swaps in the CUDA build of the speech engine. The PC also needs the
+REM  CUDA 12 and cuDNN 9 runtimes installed. Afterwards run the speed test in
+REM  the app (Models menu): it uses the graphics card only if it is quicker.
 REM ---------------------------------------------------------------------------
 cd /d "%~dp0"
 set "LOG=%~dp0build-win-log.txt"
@@ -47,6 +53,11 @@ echo [3/7] Installing dependencies (wheels only, no compiling)...
 if errorlevel 1 goto :fail
 "%VPY%" -m pip install --only-binary :all: pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+if /i not "%VERBATIM_GPU%"=="cuda" goto :nogpu
+echo       Swapping in the NVIDIA CUDA build of the speech engine ^(experimental^)...
+"%VPY%" -m pip install --only-binary :all: --force-reinstall "sherpa-onnx==1.13.8+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html >> "%LOG%" 2>&1
+if errorlevel 1 goto :fail
+:nogpu
 
 echo [4/7] Checking the code before packaging...
 REM  The working directory is already this folder, so '.' is the source tree.
@@ -56,8 +67,10 @@ REM  which would escape the closing quote and make it an unterminated literal.
 if errorlevel 1 goto :fail
 
 echo [5/7] Downloading the speech models to bake in (%BAKE_IDS%)...
-echo       About 500 MB the first time; kept in build-models for later builds.
-"%VPY%" "%~dp0verbatim.py" fetch --into "%~dp0build-models" %BAKE_IDS%
+echo       About 500 MB to download the first time; kept in build-models for later builds.
+REM  --stage copies exactly the models named here into a fresh build-bake folder,
+REM  so a model fetched for an earlier build is not baked into this one as well.
+"%VPY%" "%~dp0verbatim.py" fetch --into "%~dp0build-models" --stage "%~dp0build-bake" %BAKE_IDS%
 if errorlevel 1 goto :fail
 
 echo [6/7] Packaging (this takes a few minutes)...
@@ -71,7 +84,7 @@ if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
   --collect-all certifi ^
   --collect-submodules verbatimlib ^
   --add-data "verbatimlib\data;verbatimlib\data" ^
-  --add-data "build-models;models" ^
+  --add-data "build-bake;models" ^
   --hidden-import tkinter ^
   --hidden-import tkinter.ttk ^
   --hidden-import tkinter.filedialog ^

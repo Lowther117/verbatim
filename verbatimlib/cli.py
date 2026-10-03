@@ -5,6 +5,7 @@
   verbatim transcribe FILE ...      transcribe without the window
   verbatim models                   list the models and whether each is installed
   verbatim fetch ID ...             download models (the build files use this)
+  verbatim speedtest                time this computer and choose the fastest way to run
   verbatim selftest                 check the whole pipeline, write verbatim-selftest.txt
   verbatim engine --job FILE        (internal) one transcription job for the window
 """
@@ -22,13 +23,15 @@ from . import paths
 
 def _engine(argv: List[str]) -> int:
     """One job for the window. Progress goes to an events file, one JSON object
-    per line, because a windowed build has no usable standard output."""
+    per line, because a windowed build has no usable standard output. The
+    window asks for a stop by creating the job's "cancel" file."""
     ap = argparse.ArgumentParser(prog="verbatim engine")
     ap.add_argument("--job", required=True)
     args, _ = ap.parse_known_args(argv)
     with open(args.job, encoding="utf-8") as fh:
         job = json.load(fh)
     events_path = job["events"]
+    cancel_path = job.get("cancel") or os.path.join(os.path.dirname(os.path.abspath(args.job)), "cancel")
 
     def emit(event: dict) -> None:
         try:
@@ -38,9 +41,11 @@ def _engine(argv: List[str]) -> int:
             pass
 
     try:
-        from . import engine
+        from . import engine, proc
+        proc.be_a_good_neighbour()
         options = engine.Options.from_dict(job.get("options") or {})
-        result = engine.transcribe(job["file"], options, emit, workdir=job.get("workdir"))
+        result = engine.transcribe(job["file"], options, emit, cancelled=lambda: os.path.exists(cancel_path),
+                                   workdir=job.get("workdir"))
         tmp = job["result"] + ".part"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
@@ -48,10 +53,7 @@ def _engine(argv: List[str]) -> int:
         emit({"type": "done"})
         return 0
     except BaseException as exc:  # noqa: BLE001 - everything must reach the window
-        from .audio import AudioError
-        from .engine import EngineError
-        from .models import ModelError
-        friendly = isinstance(exc, (AudioError, EngineError, ModelError))
+        friendly = type(exc).__name__ in ("AudioError", "EngineError", "ModelError", "Cancelled")
         emit({"type": "error", "message": str(exc) if friendly else f"{type(exc).__name__}: {exc}",
               "trace": "" if friendly else traceback.format_exc()})
         return 1
@@ -63,8 +65,6 @@ def _transcribe(argv: List[str]) -> int:
     ap.add_argument("files", nargs="+")
     ap.add_argument("-o", "--output", help="folder to save into (default: the saved default, else Downloads/Verbatim)")
     ap.add_argument("--model", default=None, choices=list(models.ASR), help="speech model")
-    ap.add_argument("--language", default="", help="Whisper models: language code such as en or cy (default: detect)")
-    ap.add_argument("--translate", action="store_true", help="Whisper models: translate into English")
     ap.add_argument("--no-speakers", action="store_true", help="do not label speakers")
     ap.add_argument("--speakers", type=int, default=0, metavar="N", help="number of speakers if known (default: work it out)")
     ap.add_argument("--denoise", default="auto", choices=["auto", "on", "off"])
@@ -73,6 +73,8 @@ def _transcribe(argv: List[str]) -> int:
     ap.add_argument("--no-timestamps", action="store_true")
     ap.add_argument("--overwrite", action="store_true", help="replace existing output files instead of numbering")
     ap.add_argument("--download", action="store_true", help="download any missing model without asking")
+    ap.add_argument("--provider", default=None, choices=list(engine.PROVIDERS),
+                    help="where the models run (default: what the speed test chose, else cpu)")
     args = ap.parse_args(argv)
 
     settings = paths.load_settings()
@@ -81,10 +83,11 @@ def _transcribe(argv: List[str]) -> int:
     if bad:
         print(f"Unknown format: {', '.join(bad)}", file=sys.stderr)
         return 2
-    opts = engine.Options(model=args.model or settings.get("model") or models.DEFAULT_ASR, language=args.language,
-                          translate=args.translate, speakers=not args.no_speakers, num_speakers=args.speakers,
-                          denoise=args.denoise, filtering=args.filtering)
-    opts = engine.Options.from_dict(opts.__dict__)
+    opts = engine.Options.from_dict({
+        "model": args.model or settings.get("model") or models.DEFAULT_ASR, "speakers": not args.no_speakers,
+        "num_speakers": args.speakers, "denoise": args.denoise, "filtering": args.filtering,
+        "provider": args.provider or settings.get("provider") or "cpu",
+        "parallel": settings.get("parallel") or "auto"})
     need = models.missing(models.needed_for(opts.model, opts.speakers, opts.denoise != "off"))
     if need:
         names = ", ".join(models.CATALOGUE[m]["label"] for m in need)
@@ -98,12 +101,9 @@ def _transcribe(argv: List[str]) -> int:
     failures = 0
     for path in args.files:
         name = os.path.basename(path)
-        last = {"label": ""}
 
-        def emit(e, name=name, last=last):
+        def emit(e, name=name):
             if e.get("type") == "progress":
-                if e["label"] != last["label"]:
-                    last["label"] = e["label"]
                 print(f"\r{name}: {e['label']} {e['fraction'] * 100:3.0f}%   ", end="", file=sys.stderr, flush=True)
 
         try:
@@ -115,12 +115,29 @@ def _transcribe(argv: List[str]) -> int:
         written = export.write_all(result, folder, formats, not args.no_timestamps, args.overwrite)
         st = result["stats"]
         print(f"\r{name}: done in {st.get('seconds_taken', 0):.0f}s - {st.get('words', 0)} words, "
-              f"{len(result['speakers'])} speaker(s)            ", file=sys.stderr)
+              f"{len(result['speakers'])} speaker(s)                              ", file=sys.stderr)
         for note in result["notes"]:
             print(f"  note: {note}", file=sys.stderr)
         for p in written.values():
             print(p)
     return 1 if failures else 0
+
+
+def _speedtest(_argv: List[str]) -> int:
+    from . import speedtest
+    settings = paths.load_settings()
+    print("Timing this computer on two minutes of the sample recording. This takes a few minutes.", flush=True)
+    try:
+        out = speedtest.run(settings.get("model"), lambda text: print("  " + text, flush=True))
+    except Exception as exc:  # noqa: BLE001
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+    print(out["summary"])
+    settings.update(out["choice"])
+    settings["speedtest"] = {"when": out["when"], "summary": out["summary"]}
+    paths.save_settings(settings)
+    print("Saved. The window and the command line will use this from now on.")
+    return 0
 
 
 def _fetch_one(model_id: str, into) -> None:
@@ -146,6 +163,8 @@ def _fetch(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(prog="verbatim fetch", description="Download models.")
     ap.add_argument("ids", nargs="*", help="model ids (see: verbatim models). 'support' = the four small helper models")
     ap.add_argument("--into", help="folder to download into instead of the models folder")
+    ap.add_argument("--stage", help="with --into: copy exactly the named models into this fresh folder afterwards "
+                                    "(what a build bakes in, so that nothing else in --into comes along)")
     args = ap.parse_args(argv)
     ids: List[str] = []
     for i in args.ids:
@@ -174,6 +193,15 @@ def _fetch(argv: List[str]) -> int:
     except models.ModelError as exc:
         print(f"FAILED: {exc}", file=sys.stderr)
         return 1
+    if args.stage and args.into:
+        import shutil
+        shutil.rmtree(args.stage, ignore_errors=True)
+        for i in ids:
+            dest = os.path.join(args.stage, i)
+            os.makedirs(dest, exist_ok=True)
+            for name in models.CATALOGUE[i]["files"].values():
+                shutil.copy2(os.path.join(args.into, i, name), os.path.join(dest, name))
+        print(f"Staged {len(ids)} models for the build.")
     print("Models ready.")
     return 0
 
@@ -205,6 +233,8 @@ def main(argv: List[str]) -> int:
         return _fetch(argv[1:])
     if argv and argv[0] == "models":
         return _models(argv[1:])
+    if argv and argv[0] == "speedtest":
+        return _speedtest(argv[1:])
     if argv and argv[0] == "selftest":
         from .selftest import run
         return run(argv[1:])
