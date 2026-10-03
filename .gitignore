@@ -1,0 +1,27 @@
+# build scratch
+.venv/
+.venv-build/
+.venv-build-mac/
+build/
+dist/
+*.spec
+
+# models: downloaded, never committed (hundreds of MB)
+build-models/
+verbatim-models/
+
+# build and run output
+build-win-log.txt
+build-mac-log.txt
+verbatim-selftest.txt
+verbatim-crash.log
+verbatim-settings.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# os
+.DS_Store
+Thumbs.db

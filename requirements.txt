@@ -1,0 +1,11 @@
+# The speech engine: speech-to-text, speech detection, speaker separation and
+# noise reduction, all through ONNX Runtime (bundled inside the wheel).
+# Pinned to the version the pipeline was written and tested against.
+sherpa-onnx==1.13.8
+numpy>=1.26
+# A static ffmpeg, so "any audio or video format" needs nothing installed.
+imageio-ffmpeg>=0.5.1
+# Certificates for the one-off model downloads from GitHub.
+certifi>=2024.2.2
+# Drag and drop onto the window. The app works without it if it fails to load.
+tkinterdnd2>=0.4.2
