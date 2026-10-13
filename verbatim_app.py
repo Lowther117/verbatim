@@ -69,14 +69,39 @@ def _fix_streams():
                 pass
 
 
-def _crash(exc, dialog=True):
-    path = os.path.join(_app_dir(), "verbatim-crash.log")
-    body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+def _log_dirs():
+    """Where the crash log can go: the app's data folder (beside the app, or the
+    per-user folder when the app sits in /Applications or Program Files), then
+    beside the app, then the home folder."""
+    dirs = []
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(body + "\n" + "-" * 60 + "\n")
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from verbatimlib import paths
+        dirs.append(paths.data_dir())
     except Exception:
         pass
+    for d in (_app_dir(), os.path.expanduser("~")):
+        if d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _crash(exc, dialog=True):
+    body = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    path = None
+    for d in _log_dirs():
+        candidate = os.path.join(d, "verbatim-crash.log")
+        try:
+            with open(candidate, "a", encoding="utf-8") as fh:
+                fh.write(body + "\n" + "-" * 60 + "\n")
+            path = candidate
+            break
+        except Exception:
+            continue
+    if path is None:
+        path = "(could not be written anywhere)"
     if dialog:  # never from the engine or the self-test: those run with no one watching
         try:
             import tkinter as tk

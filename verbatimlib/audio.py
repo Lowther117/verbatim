@@ -129,6 +129,12 @@ def decode(path: str, raw_path: str, duration: Optional[float] = None,
     if highpass:
         cmd += ["-af", "highpass=f=70"]
     cmd += ["-f", "f32le", "-acodec", "pcm_f32le", raw_path]
+    # A file left from an earlier decode must not be mistaken for this one's
+    # output when ffmpeg fails before writing anything.
+    try:
+        os.remove(raw_path)
+    except OSError:
+        pass
     err_path = raw_path + ".err"
     with open(err_path, "wb") as err:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err, **_no_window())

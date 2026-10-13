@@ -128,15 +128,18 @@ def to_md(t: dict, timestamps: bool = True) -> str:
 
 
 def cues(t: dict, max_chars: int = 84, max_seconds: float = 7.0) -> List[dict]:
-    """Subtitle-sized pieces: long segments are split at word boundaries, with
-    the time shared out in proportion to the text."""
+    """Subtitle-sized pieces: segments longer than `max_chars` are split at
+    word boundaries, with the time shared out in proportion to the text. No
+    cue stays up longer than `max_seconds` or past the start of the next one."""
     out: List[dict] = []
     for seg in t.get("segments", []):
         text = " ".join(seg["text"].split())
         if not text:
             continue
         start, end = seg["start"], max(seg["end"], seg["start"] + 0.3)
-        pieces = max(1, -(-len(text) // max_chars), int(-(-(end - start) // max_seconds)))
+        # Split on length only: splitting a short line because the segment is
+        # long in time used to scatter it into one-word cues.
+        pieces = max(1, -(-len(text) // max_chars))
         if pieces == 1 or len(text.split(" ")) == 1:
             # a short line must not sit on screen for the whole of a long gap
             out.append({"start": start, "end": min(end, start + max_seconds), "speaker": seg.get("speaker"),
@@ -159,6 +162,12 @@ def cues(t: dict, max_chars: int = 84, max_seconds: float = 7.0) -> List[dict]:
             span = (end - start) * len(c) / total
             out.append({"start": pos, "end": pos + min(span, max_seconds), "speaker": seg.get("speaker"), "text": c})
             pos += span
+    # A cue ends when the next begins, so two never overlap on screen - unless
+    # the next starts almost at once (overlapping speakers), when each still
+    # gets at least half a second.
+    for cur_, nxt in zip(out, out[1:]):
+        if nxt["start"] < cur_["end"]:
+            cur_["end"] = max(nxt["start"], min(cur_["end"], cur_["start"] + 0.5))
     return out
 
 

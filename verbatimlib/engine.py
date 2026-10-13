@@ -692,6 +692,20 @@ def _words(tokens: List[str], starts: List[float], durs: List[float], offset: fl
     return out
 
 
+def timed_words(words: List[Tuple[float, float, str]], filtering: str,
+                looped: bool) -> List[Tuple[float, float, str]]:
+    """The timed words of a kept piece: tags stripped (unless filtering is off)
+    and, when judge() collapsed a looped phrase, the repeats dropped word by
+    word so every surviving word keeps its own time."""
+    if filtering != "off":
+        words = [(ws, we, filters.strip_tags(wt)) for ws, we, wt in words]
+        words = [x for x in words if x[2]]
+    if looped:
+        keep, _ = filters.collapse_repeat_words([w[2] for w in words])
+        words = [words[i] for i in keep]
+    return words
+
+
 def _db(x: float) -> float:
     return 10.0 * float(np.log10(max(x, 1e-12)))
 
@@ -972,17 +986,17 @@ def _transcribe(path: str, options: Options, emit: Callable[[dict], None],
                                           "reason": reason or "empty"})
             continue
         # stripping a [Music] tag leaves the model's own timing usable; a
-        # collapsed loop does not, and becomes one piece
+        # collapsed loop keeps it too when the words are timed one by one
+        # (Parakeet: the repeats are dropped word by word), and otherwise
+        # becomes one piece
         intact = kept == out["text"] or reason == "non-speech markers removed"
+        looped = reason == "a looped phrase was collapsed"
         if reason and not intact:
             result["removed"].append({"start": round(us, 2), "end": round(ue, 2), "text": out["text"],
                                       "reason": reason, "kept_as": kept})
         conf = None if out["confidence"] is None else round(out["confidence"], 3)
-        if timed and out["words"] and intact:
-            words = out["words"]
-            if options.filtering != "off":
-                words = [(ws, we, filters.strip_tags(wt)) for ws, we, wt in words]
-                words = [x for x in words if x[2]]
+        if timed and out["words"] and (intact or looped):
+            words = timed_words(out["words"], options.filtering, looped)
             for seg_ in words_to_segments(words, label):
                 segments.append({"start": round(seg_["start"], 2), "end": round(seg_["end"], 2),
                                  "speaker": seg_["speaker"], "text": seg_["text"], "confidence": conf})

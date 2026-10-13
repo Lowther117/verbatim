@@ -167,31 +167,41 @@ def collapse_repeats(text: str, limit: int = 3, word_limit: int = 6) -> Tuple[st
     `word_limit` times - people do say "no, no, no, no".
     """
     words = text.split()
-    if len(words) < limit + 1:
+    keep, changed = collapse_repeat_words(words, limit, word_limit)
+    if not changed:
         return text, False
+    return " ".join(words[i] for i in keep), True
+
+
+def collapse_repeat_words(words: List[str], limit: int = 3, word_limit: int = 6) -> Tuple[List[int], bool]:
+    """collapse_repeats on a list of words: the indices of the words that
+    survive, so individually timed words (Parakeet) keep their own timing."""
+    idx = list(range(len(words)))
+    if len(words) < limit + 1:
+        return idx, False
     limits = {1: word_limit}
     keys = [plain(w) for w in words]
     changed = False
     for size in range(1, min(12, len(words) // (limit + 1)) + 1):
         i = 0
-        out_w: List[str] = []
+        out_i: List[int] = []
         out_k: List[str] = []
-        while i < len(words):
+        while i < len(idx):
             unit = keys[i:i + size]
             n = 1
             while len(unit) == size and any(unit) and keys[i + n * size:i + (n + 1) * size] == unit:
                 n += 1
             if n > limits.get(size, limit):
-                out_w += words[i:i + size]
+                out_i += idx[i:i + size]
                 out_k += unit
                 i += n * size
                 changed = True
             else:
-                out_w.append(words[i])
+                out_i.append(idx[i])
                 out_k.append(keys[i])
                 i += 1
-        words, keys = out_w, out_k
-    return " ".join(words), changed
+        idx, keys = out_i, out_k
+    return idx, changed
 
 
 def confidence(log_probs) -> Optional[float]:

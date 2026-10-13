@@ -21,6 +21,11 @@ if [ ! -x "$VENV/bin/python" ]; then
   echo "First run - setting Python up. This happens once."
   PY="$(pick)" || { echo "No Python 3.11+ with a usable Tk found. Run build-app.command once; it installs one."; read -r; exit 1; }
   "$PY" -m venv "$VENV" || { echo "Could not create the environment."; read -r; exit 1; }
+fi
+# The environment can exist with its packages missing (a first run whose pip
+# install failed), so check they import rather than trusting the folder.
+if ! "$VENV/bin/python" -c 'import sherpa_onnx, numpy, imageio_ffmpeg, certifi' >/dev/null 2>&1; then
+  echo "Installing the packages..."
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { read -r; exit 1; }
 fi
