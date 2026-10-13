@@ -460,9 +460,9 @@ def run(argv: List[str]) -> int:
                 root.withdraw()
                 app = ui.App(root, [_sample()])
                 root.update()
-                app.toggle_theme()
-                root.update()
-                app.toggle_theme()
+                for _ in range(3):             # Phosphor -> Dark -> Light -> back to the start
+                    app.toggle_theme()
+                    root.update()
                 import copy
                 item = next(iter(app.items.values()))
                 item.result, item.state = copy.deepcopy(transcript), "done"
@@ -493,7 +493,7 @@ def run(argv: List[str]) -> int:
         finally:
             paths.settings_path = saved
         return f"Tk {tkv}, {dnd}"
-    rep.check("the window builds, in both themes", window_ok)
+    rep.check("the window builds, in all three themes", window_ok)
 
     shutil.rmtree(tmp, ignore_errors=True)
     rep.say()

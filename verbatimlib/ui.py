@@ -33,6 +33,9 @@ FILTER = [("balanced", "Balanced (recommended)"), ("strict", "Strict - leave out
           ("off", "Off - keep everything the model returns")]
 SPEAKER_COUNTS = ["Work it out"] + [str(n) for n in range(1, 13)]
 # One colour per speaker name, readable on the dark and on the light panel.
+# Phosphor leads with Winnow's graph colours so the transcript matches the theme.
+SPEAKER_PHOSPHOR = ["#b77dff", "#7de3a6", "#ffc56b", "#ff6b8e", "#7f9dff", "#e58cff", "#4dd0e1", "#aed581",
+                    "#f78c6c", "#9b88c6"]
 SPEAKER_DARK = ["#5b9cff", "#4ac26b", "#e0b44a", "#ff8a80", "#c792ea", "#4dd0e1", "#f78c6c", "#aed581",
                 "#ff80ab", "#90a4ae"]
 SPEAKER_LIGHT = ["#1f6feb", "#146c2e", "#8a5a00", "#b42318", "#7b3fb5", "#00707d", "#b3541e", "#4b7a12",
@@ -108,8 +111,9 @@ class App:
     def __init__(self, root: tk.Misc, files: Optional[List[str]] = None):
         self.root = root
         self.settings = paths.load_settings()
-        self.dark = bool(self.settings.get("dark", True))
-        self.c = theme.apply(root, self.dark)
+        self.theme_name = theme.from_settings(self.settings)   # phosphor purple by default
+        self.dark = theme.is_dark(self.theme_name)
+        self.c = theme.apply(root, self.theme_name)
         self.ui = theme.ui_family(root)
         self.mono = theme.mono_family(root)
         root.title(f"{paths.APP} - speech to text")
@@ -224,7 +228,7 @@ class App:
         mo.add_command(label="Test this computer's speed…", command=self.speed_test)
         m.add_cascade(label="Models", menu=mo)
         v = tk.Menu(m, tearoff=0)
-        v.add_command(label="Toggle light / dark", accelerator=f"{KEY}+D", command=self.toggle_theme)
+        v.add_command(label="Next theme (Phosphor / Dark / Light)", accelerator=f"{KEY}+D", command=self.toggle_theme)
         m.add_cascade(label="View", menu=v)
         h = tk.Menu(m, tearoff=0)
         h.add_command(label="How it works", command=self.show_help)
@@ -242,7 +246,7 @@ class App:
         ttk.Label(top, text=paths.APP, style="Title.TLabel").pack(side="left")
         ttk.Label(top, text="   audio and video to text, with speakers - all on this computer",
                   style="Sub.TLabel").pack(side="left", pady=(5, 0))
-        self.btn_theme = ttk.Button(top, text="Light", width=7, command=self.toggle_theme)
+        self.btn_theme = ttk.Button(top, text="Dark", width=9, command=self.toggle_theme)
         self.btn_theme.pack(side="right")
 
         self.hint = ttk.Frame(root, style="Hint.TFrame")
@@ -439,7 +443,7 @@ class App:
         self.text.tag_configure("head", font=(self.ui, 12, "bold"))
         self.text.tag_configure("bad", foreground=c["bad"])
         self.text.tag_configure("warn", foreground=c["warn"])
-        palette = SPEAKER_DARK if self.dark else SPEAKER_LIGHT
+        palette = {"phosphor": SPEAKER_PHOSPHOR, "dark": SPEAKER_DARK}.get(self.theme_name, SPEAKER_LIGHT)
         for i, colour in enumerate(palette):
             self.text.tag_configure(f"spk{i}", foreground=colour, font=(self.ui, 11, "bold"))
         for menu in self.menus:
@@ -450,12 +454,14 @@ class App:
         self.tree.tag_configure("working", foreground=c["accent"])
         self.tree.tag_configure("waiting", foreground=c["text"])
         self.tree.tag_configure("stopped", foreground=c["warn"])
-        self.btn_theme.configure(text="Light" if self.dark else "Dark")
+        self.btn_theme.configure(text=theme.short_label(theme.next_theme(self.theme_name)))
 
     def toggle_theme(self):
-        self.dark = not self.dark
-        self.c = theme.apply(self.root, self.dark)
+        self.theme_name = theme.next_theme(self.theme_name)
+        self.dark = theme.is_dark(self.theme_name)
+        self.c = theme.apply(self.root, self.theme_name)
         self._recolor()
+        self.settings["theme"] = self.theme_name
         self.settings["dark"] = self.dark
         paths.save_settings(self.settings)
         if self.shown and self.shown in self.items:

@@ -127,7 +127,7 @@ Each file is transcribed in a separate engine process, so Stop is instant, the w
 | `verbatimlib/proc.py` | Starting and stopping the engine process |
 | `verbatimlib/speedtest.py` | The speed test |
 | `verbatimlib/selftest.py` | The self-test |
-| `verbatimlib/theme.py` | Shared light/dark theme (same file as the other apps) |
+| `verbatimlib/theme.py` | Shared house theme - Phosphor purple (default), Dark, Light (same file as the other apps) |
 | `ensure_python.ps1` | Finds or installs Python on Windows |
 
 Settings (`verbatim-settings.json`), downloaded models and any crash log live beside the app, never inside it. If that folder cannot be written to (the app is in `/Applications` or `Program Files`), they go to the per-user application data folder instead; Help > About shows which.
