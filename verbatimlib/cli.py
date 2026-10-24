@@ -95,8 +95,12 @@ def _transcribe(argv: List[str]) -> int:
             print(f"Missing models: {names}\nRun again with --download, or: verbatim fetch {' '.join(need)}",
                   file=sys.stderr)
             return 1
-        for m in need:
-            _fetch_one(m, None)
+        try:
+            for m in need:
+                _fetch_one(m, None)
+        except models.ModelError as exc:
+            print(f"FAILED: {exc}", file=sys.stderr)
+            return 1
     folder = args.output or paths.default_save_dir(settings)
     failures = 0
     for path in args.files:
@@ -112,7 +116,12 @@ def _transcribe(argv: List[str]) -> int:
             print(f"\n{name}: FAILED - {exc}", file=sys.stderr)
             failures += 1
             continue
-        written = export.write_all(result, folder, formats, not args.no_timestamps, args.overwrite)
+        try:
+            written = export.write_all(result, folder, formats, not args.no_timestamps, args.overwrite)
+        except OSError as exc:  # disk full, folder gone, no permission: the other files can still be done
+            print(f"\n{name}: FAILED - could not save to {folder}: {exc}", file=sys.stderr)
+            failures += 1
+            continue
         st = result["stats"]
         print(f"\r{name}: done in {st.get('seconds_taken', 0):.0f}s - {st.get('words', 0)} words, "
               f"{len(result['speakers'])} speaker(s)                              ", file=sys.stderr)

@@ -96,11 +96,19 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
+    # written aside and swapped in, so a crash mid-write cannot leave a
+    # truncated file that load_settings would read as "no settings at all"
+    path = settings_path()
+    tmp = path + ".part"
     try:
-        with open(settings_path(), "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(settings, fh, indent=1)
+        os.replace(tmp, path)
     except Exception:  # noqa: BLE001
-        pass
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def downloads_dir() -> str:
