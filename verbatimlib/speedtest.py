@@ -121,8 +121,8 @@ def run(model: Optional[str] = None, report: Optional[Callable[[str], None]] = N
         if not cpu_ok:
             raise engine.EngineError("The speed test could not complete even the plain run: "
                                      + (results[0].get("why") or "unknown reason"))
-        cpu_best = next(x for x in cpu_ok if x["parallel"] == best_parallel)
-        choice = {"provider": "cpu", "parallel": best_parallel}
+        cpu_best = next((x for x in cpu_ok if x["parallel"] == best_parallel), cpu_ok[0])
+        choice = {"provider": "cpu", "parallel": cpu_best["parallel"]}
         winner = cpu_best
         for x in results:
             # a back end that silently fell back to the processor shows no gain and is never chosen

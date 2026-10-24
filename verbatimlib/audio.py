@@ -139,17 +139,23 @@ def decode(path: str, raw_path: str, duration: Optional[float] = None,
     with open(err_path, "wb") as err:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err, **_no_window())
         expected = duration * RATE * 4 if duration else None
-        while proc.poll() is None:
-            if cancelled and cancelled():
+        try:
+            while proc.poll() is None:
+                if cancelled and cancelled():
+                    raise AudioError("Cancelled.")
+                if progress and expected:
+                    try:
+                        progress(min(0.99, os.path.getsize(raw_path) / expected))
+                    except OSError:
+                        pass
+                time.sleep(0.1)
+        except BaseException:
+            # the progress callback can raise too (the engine's raises Cancelled):
+            # never leave ffmpeg running and writing into the work folder
+            if proc.poll() is None:
                 proc.kill()
-                proc.wait()
-                raise AudioError("Cancelled.")
-            if progress and expected:
-                try:
-                    progress(min(0.99, os.path.getsize(raw_path) / expected))
-                except OSError:
-                    pass
-            time.sleep(0.1)
+            proc.wait()
+            raise
     try:
         with open(err_path, encoding="utf-8", errors="replace") as fh:
             stderr = fh.read()
