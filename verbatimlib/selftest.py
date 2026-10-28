@@ -221,6 +221,48 @@ def run(argv: List[str]) -> int:
         return "each word goes to one speaker; a late hand-over snaps to the sentence"
     rep.check("sharing words out between speakers", words_ok)
 
+    def readalong_timing_ok():
+        from . import engine as e
+        from . import readalong
+        segs = e.words_to_segments([(0.1, 0.5, "Shall"), (0.6, 0.9, "we"), (1.0, 1.4, "start?")], None)
+        if segs[0]["words"] != [(0.1, 0.5), (0.6, 0.9), (1.0, 1.4)]:
+            raise AssertionError(f"word times not kept: {segs[0].get('words')}")
+        bad = []
+
+        def check(name, cond, detail=""):
+            if not cond:
+                bad.append(f"{name} ({detail})" if detail else name)
+        readalong.selftest_checks(check)
+        if bad:
+            raise AssertionError("; ".join(bad))
+        return "word times kept, sentences cut back to back, long pauses shortened"
+    rep.check("read along: timing", readalong_timing_ok)
+
+    def readalong_audio_ok():
+        from . import readalong
+        t = {"duration": 4.0, "speakers": {}, "segments": [
+            {"start": 0.5, "end": 1.5, "speaker": None, "text": "One two."},
+            {"start": 1.6, "end": 3.0, "speaker": None, "text": "Three four five."}]}
+        tr = readalong.Track(t)
+        eng = readalong.RecordingEngine()
+        eng.set_source(_sample(), tr)
+        try:
+            words = tr.doc.words
+            a = eng.synth(words[0:2], "", "original", 1.0)
+            b = eng.synth(words[2:5], "", "original", 1.5)
+            want_a = (tr.spans[0][1] - tr.spans[0][0]) * readalong.RATE * 2
+            if abs(len(a.pcm) - want_a) > 4 or not any(a.pcm):
+                raise AssertionError(f"the first sentence is {len(a.pcm)} bytes, wanted {int(want_a)}")
+            want_b = (tr.spans[1][1] - tr.spans[1][0]) / 1.5 * readalong.RATE * 2
+            if abs(len(b.pcm) - want_b) > want_b * 0.1:
+                raise AssertionError(f"1.5x playback is {len(b.pcm)} bytes, wanted about {int(want_b)}")
+            if not (0.0 <= a.times[0][0] < a.times[1][0] < a.seconds):
+                raise AssertionError(f"word times fall outside the clip: {a.times}")
+        finally:
+            eng.close()
+        return f"decoded once, cut to the sample, 1.5x through atempo ({len(b.pcm) // 2} samples)"
+    rep.check("read along: plays the recording", readalong_audio_ok)
+
     def refine_ok():
         import numpy as np
         from . import engine as e
@@ -471,6 +513,20 @@ def run(argv: List[str]) -> int:
                 shown = app.text.get("1.0", "end")
                 if "Dan" not in shown or "budget" not in shown:
                     raise AssertionError("the transcript pane did not show the transcript")
+                # read along: a click puts the marker on that word, in the pane
+                if not app._listen:
+                    app.toggle_listen()
+                doc = app._read_doc()
+                k = next((n for n, w in enumerate(doc.words) if w.clean.lower() == "budget"), None)
+                if k is None:
+                    raise AssertionError("the read-along text is missing words")
+                app.bar.set_cursor(k)
+                root.update()
+                rng = app.text.tag_ranges("ra_word")
+                if not rng or app.text.get(rng[0], rng[1]).strip(".,?!") != "budget":
+                    raise AssertionError(f"read along highlighted {app.text.get(rng[0], rng[1]) if rng else 'nothing'!r}")
+                app.toggle_listen()
+                root.update()
                 # hand the first paragraph to the other speaker, as the right-click menu does
                 app._reassign(item, item.result, list(app._para_spans[0]["segments"]), "S2")
                 root.update()

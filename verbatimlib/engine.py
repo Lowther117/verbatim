@@ -437,7 +437,8 @@ def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.
     or two flipped to someone else in the middle of one person's sentence
     (the speaker model wobbling for a fraction of a second) is flipped back.
     Sentences end at the model's own full stops and wherever the speaker
-    changes. Returns [{"start", "end", "speaker", "text"}].
+    changes. Returns [{"start", "end", "speaker", "text", "words"}], "words"
+    being each word's (start, end) in the order the text has them.
     """
     if not words:
         return []
@@ -510,10 +511,11 @@ def words_to_segments(words: List[Tuple[float, float, str]], label: Optional[np.
         if cur is None or cur["speaker"] != k:
             if cur is not None:
                 out.append(cur)
-            cur = {"start": ws, "end": we, "speaker": k, "text": text}
+            cur = {"start": ws, "end": we, "speaker": k, "text": text, "words": [(ws, we)]}
         else:
             cur["text"] += " " + text
             cur["end"] = we
+            cur["words"].append((ws, we))
         if _ends_sentence(text, words[n + 1][2] if n + 1 < len(words) else None):
             out.append(cur)
             cur = None
@@ -999,7 +1001,8 @@ def _transcribe(path: str, options: Options, emit: Callable[[dict], None],
             words = timed_words(out["words"], options.filtering, looped)
             for seg_ in words_to_segments(words, label):
                 segments.append({"start": round(seg_["start"], 2), "end": round(seg_["end"], 2),
-                                 "speaker": seg_["speaker"], "text": seg_["text"], "confidence": conf})
+                                 "speaker": seg_["speaker"], "text": seg_["text"], "confidence": conf,
+                                 "words": [[round(a, 2), round(b, 2)] for a, b in seg_["words"]]})
             continue
         parts = out["parts"] if intact else [(us, min(ue, us + max(2.0, len(kept) / 12.0)), kept)]
         for ps, pe, pt in parts:

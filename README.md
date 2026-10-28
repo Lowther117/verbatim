@@ -12,6 +12,7 @@ Windows and macOS.
 - **Noise handling and invented-text protection.** See [Keeping invented text out](#keeping-invented-text-out).
 - **Seven outputs.** Plain text, Word (.docx), Markdown, SRT and VTT subtitles, CSV, and JSON with every timestamp and confidence score. Tick the ones you want and each transcript is saved in all of them.
 - **Saved to Downloads.** Transcripts go to `Downloads/Verbatim` unless you choose another folder (File > Default save folder…). An existing file is never overwritten: the new one becomes `name (2).txt`.
+- **Read along.** Press **Read along** above a transcript and **Read** plays the original recording while each word lights up as it is said. Click any word to jump there. An RSVP panel can flash the words one at a time in step with the voice, or, with Audio unticked, speed-read the transcript silently at a words-per-minute you set. See [Read along](#read-along).
 - **Come back later.** Tick JSON and the saved file can be reopened (File > Open saved transcript) to rename speakers or save other formats without transcribing again.
 - **Looks after the machine.** While a file is running the computer is kept awake, and the work runs at below-normal priority so everything else stays usable. Stop is immediate and leaves nothing behind.
 
@@ -77,6 +78,20 @@ Either way, mistakes are quick to fix afterwards:
 
 The saved files are rewritten each time. Expect mistakes where people talk over each other, on very short turns ("yes", "okay"), between voices that sound alike, and when one person's sound changes a lot mid-recording (moving from a headset to a phone, say), which can still show up as an extra speaker. Speaker labels are a strong first draft, not a record.
 
+## Read along
+
+**Read along** (above the transcript) opens a strip with **Read**, stop, back and forward a sentence, and a speed slider (0.5× to 3×; the pitch stays put). Read plays the recording the transcript was made from and highlights the word being said, with its sentence shaded; the pane scrolls to keep up. Click a word to move the marker there, or to jump there while it plays. Silences longer than a second and a half between sentences are cut to about half a second, so a quiet stretch doesn't leave you waiting.
+
+- **RSVP panel** flashes one word at a time, pinned on its recognition letter, in step with the recording.
+- **Audio** unticked turns the same panel and highlight into a silent speed-reader, paced by the **WPM** slider.
+- **Keys:** Ctrl+Space read/pause, Ctrl+Left/Right a sentence back/forward, Ctrl+Up/Down speed (or WPM), Ctrl+R the RSVP panel. These are Ctrl on a Mac too.
+
+Timing: Parakeet times every word itself, and the transcript keeps those times (the `words` list on each segment of the JSON), so the highlight is exact. Whisper only times phrases, so within each phrase the words are spread by their length, which is close but not exact. A JSON transcript saved by an older version has no word times and is treated the same way.
+
+The recording is decoded once, the first time you press Read, to a plain WAV in the temp folder (about 170 MB an hour; deleted when you close the app). That takes a few seconds for a long video; the strip shows the progress. Reopened transcripts play from wherever the recording was when it was transcribed; if it has moved since, untick Audio to speed-read without it.
+
+Playback uses [miniaudio](https://github.com/irmen/pyminiaudio) when it is installed (the run and build scripts try it), which keeps the audio gapless; without it each sentence plays through the system player (afplay on a Mac, winsound on Windows) with a tiny gap between sentences.
+
 ## Speed, and using the graphics processor
 
 **Speed > Test this computer…** times the different ways of running on two minutes of sample audio and keeps whichever is quickest on that computer. It is worth doing once per machine, because none of this can be decided from a specification sheet:
@@ -123,6 +138,8 @@ Each file is transcribed in a separate engine process, so Stop is instant, the w
 | `verbatimlib/models.py` | Model catalogue and downloads |
 | `verbatimlib/export.py` | The seven output formats |
 | `verbatimlib/ui.py` | The window |
+| `verbatimlib/readalong.py` | Read along: plays the recording a sentence at a time with each word's time |
+| `verbatimlib/readaloud.py` | Playback, highlight and RSVP (same file as Hayloft and Lectern) |
 | `verbatimlib/cli.py` | Command line |
 | `verbatimlib/proc.py` | Starting and stopping the engine process |
 | `verbatimlib/speedtest.py` | The speed test |
@@ -142,4 +159,4 @@ Settings (`verbatim-settings.json`), downloaded models and any crash log live be
 
 ## Credits and licences
 
-Verbatim itself is MIT-0 (see `LICENSE`). It stands on: [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0), ONNX Runtime (MIT), FFmpeg via [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), NVIDIA Parakeet TDT 0.6B (CC-BY-4.0), OpenAI Whisper (MIT), Silero VAD (MIT), pyannote segmentation 3.0 (MIT), NVIDIA TitaNet (CC-BY-4.0) and GTCRN (MIT).
+Verbatim itself is MIT-0 (see `LICENSE`). It stands on: [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0), ONNX Runtime (MIT), FFmpeg via [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), NVIDIA Parakeet TDT 0.6B (CC-BY-4.0), OpenAI Whisper (MIT), Silero VAD (MIT), pyannote segmentation 3.0 (MIT), NVIDIA TitaNet (CC-BY-4.0), GTCRN (MIT) and, for read along, miniaudio (MIT) when installed.

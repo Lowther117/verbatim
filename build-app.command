@@ -104,6 +104,15 @@ echo "[3/8] Installing dependencies (wheels only, no compiling)..."
 "$VPY" -m pip install --upgrade pip wheel >/dev/null || die "pip would not upgrade."
 "$VPY" -m pip install --only-binary :all: -r "$HERE/requirements.txt" || die "A dependency has no wheel for this Mac."
 "$VPY" -m pip install --only-binary :all: pyinstaller || die "PyInstaller would not install."
+# miniaudio plays the read-along audio gaplessly. Optional: without it the app plays
+# each sentence through afplay. Its compiled half is a cffi module that imports
+# _cffi_backend at C level, which PyInstaller cannot see - hence the extra flags.
+MA_FLAGS=""
+if "$VPY" -m pip install --only-binary :all: miniaudio; then
+  MA_FLAGS="--hidden-import miniaudio --hidden-import _miniaudio --hidden-import _cffi_backend --collect-all cffi"
+else
+  echo "      (miniaudio did not install - read along plays through afplay instead)"
+fi
 
 echo "[4/8] Checking the code before packaging..."
 "$VPY" -c "import sys; sys.path.insert(0,'.'); import sherpa_onnx, imageio_ffmpeg, numpy; import verbatimlib.ui, verbatimlib.engine, verbatimlib.export, verbatimlib.selftest; print('      imports ok')" \
@@ -136,6 +145,7 @@ rm -rf "$HERE/build" "$HERE/dist"
   --hidden-import tkinter.ttk \
   --hidden-import tkinter.filedialog \
   --hidden-import tkinter.messagebox \
+  $MA_FLAGS \
   --exclude-module pytest \
   "$HERE/verbatim_app.py" || die "PyInstaller failed - see the log above."
 [ -d "$HERE/dist/Verbatim.app" ] || die "dist/Verbatim.app was not produced."

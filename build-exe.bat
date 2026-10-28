@@ -53,6 +53,17 @@ echo [3/7] Installing dependencies (wheels only, no compiling)...
 if errorlevel 1 goto :fail
 "%VPY%" -m pip install --only-binary :all: pyinstaller >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+REM  miniaudio plays the read-along audio gaplessly. Optional: without it the
+REM  program plays each sentence through winsound. Its compiled half imports
+REM  _cffi_backend at C level, which PyInstaller cannot see - hence the flags.
+set "MA_FLAGS="
+"%VPY%" -m pip install --only-binary :all: miniaudio >> "%LOG%" 2>&1
+if errorlevel 1 goto :noma
+set "MA_FLAGS=--hidden-import miniaudio --hidden-import _miniaudio --hidden-import _cffi_backend --collect-all cffi"
+goto :madone
+:noma
+echo       miniaudio did not install - read along plays through winsound instead.
+:madone
 if /i not "%VERBATIM_GPU%"=="cuda" goto :nogpu
 echo       Swapping in the NVIDIA CUDA build of the speech engine ^(experimental^)...
 "%VPY%" -m pip install --only-binary :all: --force-reinstall "sherpa-onnx==1.13.8+cuda12.cudnn9" -f https://k2-fsa.github.io/sherpa/onnx/cuda.html >> "%LOG%" 2>&1
@@ -89,6 +100,7 @@ if exist "%~dp0dist" rmdir /s /q "%~dp0dist"
   --hidden-import tkinter.ttk ^
   --hidden-import tkinter.filedialog ^
   --hidden-import tkinter.messagebox ^
+  %MA_FLAGS% ^
   --exclude-module pytest ^
   "%~dp0verbatim_app.py" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail

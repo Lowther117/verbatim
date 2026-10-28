@@ -29,4 +29,11 @@ if ! "$VENV/bin/python" -c 'import sherpa_onnx, numpy, imageio_ffmpeg, certifi' 
   "$VENV/bin/python" -m pip install --upgrade pip >/dev/null
   "$VENV/bin/python" -m pip install --only-binary :all: -r requirements.txt || { read -r; exit 1; }
 fi
+# miniaudio (gapless read-along audio) is optional and may have no wheel yet for a
+# brand-new Python, so it is tried once rather than on every launch.
+if [ ! -e "$VENV/.miniaudio-tried" ]; then
+  "$VENV/bin/python" -m pip install --only-binary :all: miniaudio >/dev/null 2>&1 \
+    || echo "(miniaudio did not install - read along plays through afplay instead)"
+  touch "$VENV/.miniaudio-tried"
+fi
 exec "$VENV/bin/python" verbatim.py "$@"

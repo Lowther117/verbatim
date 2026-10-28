@@ -14,7 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
-from . import audio, export, models, paths, proc, theme
+from . import audio, export, models, paths, proc, readalong, theme
 
 try:  # optional: native drag and drop. The window works without it.
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
@@ -68,6 +68,14 @@ SPEED
 a time, both stages at once, and the graphics processor where there is one - and keeps whichever is quickest \
 here. It is worth doing once on each computer.
 
+READ ALONG
+Press "Read along" above a finished transcript and Read plays the original recording while each word lights up \
+as it is said; click any word to jump there. The RSVP panel flashes the words one at a time in step with the \
+recording. Untick Audio to speed-read the transcript silently at the words-per-minute you set. Speed changes the \
+playback without changing the pitch. Word timing is exact with Parakeet; with Whisper it is close but estimated \
+within each sentence. Ctrl+Space reads or pauses, Ctrl+Left and Right skip a sentence, Ctrl+Up and Down change \
+the speed, Ctrl+R shows or hides the RSVP panel (Ctrl on a Mac too).
+
 COMING BACK TO A TRANSCRIPT
 Tick JSON under "Save each transcript as" and the saved .json file can be reopened later (File > Open saved \
 transcript) to rename speakers or save other formats without transcribing again.
@@ -107,6 +115,36 @@ class Item:
         self.fraction = 0.0
 
 
+class _BarHost:
+    """What the read-along strip (readaloud.ReadBar) expects of its app."""
+
+    def __init__(self, app: "App"):
+        self._app = app
+        self.last_log = ""
+
+    @property
+    def palette(self) -> dict:
+        return self._app.c
+
+    @property
+    def s(self) -> dict:
+        return self._app.settings
+
+    @property
+    def root(self):
+        return self._app.root
+
+    @property
+    def ui(self) -> str:
+        return self._app.ui
+
+    def save_settings(self):
+        paths.save_settings(self._app.settings)
+
+    def log(self, msg: str):
+        self.last_log = str(msg)
+
+
 class App:
     def __init__(self, root: tk.Misc, files: Optional[List[str]] = None):
         self.root = root
@@ -137,6 +175,10 @@ class App:
         self.cancel_download = threading.Event()
         self._closing = False
         self._para_spans: List[dict] = []
+        self._track: Optional[readalong.Track] = None       # the read-along text and timing of the shown transcript
+        self._track_key = None                              # (item id, id of its result) it was built from
+        self.hl: Optional[readalong.TranscriptHighlighter] = None
+        self._listen = bool(self.settings.get("readalong_show", False))
 
         s = self.settings
         self.v_model = tk.StringVar()
@@ -190,7 +232,7 @@ class App:
             base = tempfile.gettempdir()
             cutoff = time.time() - 12 * 3600
             for name in os.listdir(base):
-                if name.startswith(("verbatim-job-", "verbatim-speedtest-")):
+                if name.startswith(("verbatim-job-", "verbatim-speedtest-", "verbatim-listen-")):
                     p = os.path.join(base, name)
                     if os.path.isdir(p) and os.path.getmtime(p) < cutoff:
                         shutil.rmtree(p, ignore_errors=True)
@@ -319,8 +361,11 @@ class App:
         self.btn_removed.pack(side="right", padx=(0, 6))
         self.btn_rename = ttk.Button(tools, text="Rename speakers…", command=self.rename_speakers)
         self.btn_rename.pack(side="right", padx=(0, 6))
+        self.btn_listen = ttk.Button(tools, text="Read along", command=self.toggle_listen)
+        self.btn_listen.pack(side="right", padx=(0, 6))
         wrap = ttk.Frame(tframe)
         wrap.pack(fill="both", expand=True)
+        self._text_wrap = wrap
         self.text = tk.Text(wrap, wrap="word", relief="flat", borderwidth=0, padx=14, pady=10, height=12,
                             font=(self.ui, 11), spacing1=1, spacing3=3, undo=False)
         tsb = ttk.Scrollbar(wrap, orient="vertical", command=self.text.yview)
@@ -328,6 +373,10 @@ class App:
         tsb.pack(side="right", fill="y")
         self.text.pack(side="left", fill="both", expand=True)
         split.add(tframe, weight=3)
+        # read along: the strip sits under the transcript's buttons, the RSVP panel above the text
+        self.bar = readalong.RecordingBar(tframe, _BarHost(self), get_doc=self._read_doc, on_word=self._read_word,
+                                          rsvp_parent=tframe, rsvp_before=wrap)
+        self._show_listen(self._listen)
         self._drop_targets = [top, bar, status, body, side, qframe, tframe, tools, self.tree, self.text]
         self._placeholder()
 
@@ -424,6 +473,14 @@ class App:
         self.tree.bind("<Double-1>", self._double_click)
         for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
             self.text.bind(seq, self._paragraph_menu)
+        self.text.bind("<ButtonRelease-1>", self._text_clicked)
+        # read-along keys work anywhere in the window, but only while the strip is showing
+        bar = self.bar
+        for seq, fn in (("<Control-space>", bar.toggle), ("<Control-Right>", lambda: bar.skip(1)),
+                        ("<Control-Left>", lambda: bar.skip(-1)), ("<Control-Up>", lambda: bar._nudge_rate(1)),
+                        ("<Control-Down>", lambda: bar._nudge_rate(-1)),
+                        ("<Control-r>", lambda: (bar.var_rsvp.set(not bar.var_rsvp.get()), bar._rsvp_toggled()))):
+            r.bind(seq, lambda _e, fn=fn: (fn(), "break")[1] if self._listen else None)
         if _HAVE_DND:
             for w in self._drop_targets:
                 try:
@@ -455,6 +512,9 @@ class App:
         self.tree.tag_configure("waiting", foreground=c["text"])
         self.tree.tag_configure("stopped", foreground=c["warn"])
         self.btn_theme.configure(text=theme.short_label(theme.next_theme(self.theme_name)))
+        self.bar.apply_palette(c)
+        if self.hl is not None:
+            self.hl.apply_palette(c)
 
     def toggle_theme(self):
         self.theme_name = theme.next_theme(self.theme_name)
@@ -1191,6 +1251,7 @@ class App:
         for b in (self.btn_rename, self.btn_copy, self.btn_saveas, self.btn_removed, self.btn_folder):
             b.configure(state="disabled")
         self.btn_removed.configure(text="Removed")
+        self._after_show(None)
 
     def _show(self, item: Item):
         self.shown = item.id
@@ -1212,6 +1273,7 @@ class App:
                 self._write([("Working on this one…\n", ("dim",))])
             else:
                 self._write([(item.status + "\n", ("dim",))])
+            self._after_show(item)
             return
         parts = []
         hours = (t.get("duration") or 0) >= 3600
@@ -1241,15 +1303,89 @@ class App:
                 tag = f"spk{names.index(who) % len(SPEAKER_DARK)}" if who in names else "head"
                 parts.append((who, (tag, ptag)))
                 parts.append((f"   {stamp}\n", ("time", ptag)))
-                parts.append((p["text"] + "\n", (ptag,)))
-                parts.append(("\n", ()))
             else:
                 parts.append((f"{stamp}   ", ("time", ptag)))
-                parts.append((p["text"] + "\n", (ptag,)))
-                parts.append(("\n", ()))
+            # body{n}: the paragraph's own words, which read along highlights
+            parts.append((p["text"], (ptag, f"body{n}")))
+            parts.append(("\n", (ptag,)))
+            parts.append(("\n", ()))
         if not t.get("segments"):
             parts.append(("No speech was found in this recording.\n", ("warn",)))
         self._write(parts)
+        self._after_show(item)
+
+    # --- read along ---------------------------------------------------------------------
+
+    def toggle_listen(self):
+        self._listen = not self._listen
+        self.settings["readalong_show"] = self._listen
+        paths.save_settings(self.settings)
+        self._show_listen(self._listen)
+
+    def _show_listen(self, show: bool):
+        bar = self.bar
+        if bar._rsvp_packed:                # repacked below the strip, or hidden with it
+            bar.rsvp.frame.pack_forget()
+            bar._rsvp_packed = False
+        if show:
+            bar.frame.pack(fill="x", before=self._text_wrap)
+            bar._update_mode_widgets()
+        else:
+            bar.stop()
+            bar.frame.pack_forget()
+        self.btn_listen.configure(text="Hide read along" if show else "Read along")
+
+    def _after_show(self, item: Optional[Item]):
+        """The transcript pane was redrawn: keep reading if it is the same text, otherwise stop."""
+        t = item.result if item is not None else None
+        have = bool(t and t.get("segments"))
+        self.btn_listen.configure(state="normal" if (have or self._listen) else "disabled")
+        key = (item.id, id(t)) if have else None
+        old = self._track
+        if old is not None and have and item.id == self._track_key[0]:
+            new = readalong.Track(t)
+            if new.text == old.text:            # a speaker renamed, the theme changed: same words, same places
+                self._track_key = key
+                if self.hl is not None:
+                    self.hl.rebuilt()
+                return
+        if old is not None or self.bar.mode != "idle":
+            self.bar.document_changed()
+        self._track, self._track_key, self.hl = None, None, None
+
+    def _read_doc(self):
+        """The read-along text of the transcript on show, built when first wanted."""
+        item = self._current_result()
+        if item is None or not item.result.get("segments"):
+            return None
+        key = (item.id, id(item.result))
+        if self._track is None or self._track_key != key:
+            self._track = readalong.Track(item.result)
+            self._track_key = key
+            self.hl = readalong.TranscriptHighlighter(self.text, self._track, self.c)
+        self.bar.reader.rec.set_source(item.path, self._track)
+        return self._track.doc
+
+    def _read_word(self, i):
+        if self.hl is not None:
+            self.hl.show(i)
+
+    def _text_clicked(self, event):
+        """A click on a word moves the read-along marker there (and jumps there while reading)."""
+        if not self._listen or event.state & 0x0004:     # Control-click is the paragraph menu on a Mac
+            return None
+        try:
+            if self.text.tag_ranges("sel"):     # selecting text to copy, not pointing
+                return None
+        except tk.TclError:
+            pass
+        doc = self._read_doc()
+        if doc is None or not doc.words or self.hl is None:
+            return None
+        i = self.hl.word_at(f"@{event.x},{event.y}")
+        if i is not None:
+            self.bar.set_cursor(i)
+        return None
 
     def _paragraph_menu(self, event):
         """Right-click on a paragraph: say who really spoke it."""
@@ -1575,6 +1711,10 @@ class App:
         if self.running:
             self.stop(ask=False)
         self.cancel_download.set()
+        try:
+            self.bar.close()                # stops playback and deletes the decoded copy of the recording
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self.settings["geometry"] = self.root.winfo_geometry()
             paths.save_settings(self.settings)

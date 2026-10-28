@@ -4,7 +4,8 @@ A transcript is a plain dict (it is also exactly what the JSON export holds):
 
     {"file": ..., "duration": seconds, "language": "en", "model": "...",
      "speakers": {"S1": "Speaker 1", ...},          # id -> display name
-     "segments": [{"start", "end", "speaker", "text", "confidence"}, ...],
+     "segments": [{"start", "end", "speaker", "text", "confidence",
+                   "words": [[start, end], ...]}, ...],   # word times: Parakeet only
      "removed":  [{"start", "end", "text", "reason"}, ...],
      "notes": [...]}
 
@@ -219,7 +220,25 @@ def to_csv(t: dict) -> str:
 
 
 def to_json(t: dict) -> str:
-    return json.dumps(t, indent=1, ensure_ascii=False)
+    """Indented for reading, except each segment's word times, which go on one line
+    (indented, a long recording's word times alone would run to a million lines)."""
+    segs = t.get("segments")
+    if not isinstance(segs, list) or not any(isinstance(s, dict) and "words" in s for s in segs):
+        return json.dumps(t, indent=1, ensure_ascii=False)
+    flat = {}
+    copy = dict(t)
+    copy["segments"] = []
+    for n, s in enumerate(segs):
+        if isinstance(s, dict) and "words" in s:
+            s = dict(s)
+            mark = f"\u0000words{n}\u0000"
+            flat[json.dumps(mark)] = json.dumps(s["words"], separators=(",", ":"))
+            s["words"] = mark
+        copy["segments"].append(s)
+    text = json.dumps(copy, indent=1, ensure_ascii=False)
+    for mark, words in flat.items():
+        text = text.replace(mark, words, 1)
+    return text
 
 
 # --- Word ---------------------------------------------------------------------

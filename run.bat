@@ -26,6 +26,12 @@ if errorlevel 1 ( echo Could not create the environment. & pause & exit /b 1 )
 if errorlevel 1 ( pause & exit /b 1 )
 
 :run
+REM  miniaudio (gapless read-along audio) is optional and may have no wheel yet
+REM  for a brand-new Python, so it is tried once rather than on every launch.
+if exist "%VENV%\.miniaudio-tried" goto :launch
+"%VENV%\Scripts\python.exe" -m pip install --only-binary :all: miniaudio >nul 2>&1
+type nul > "%VENV%\.miniaudio-tried"
+:launch
 if "%~1"=="" goto :window
 REM  with arguments (transcribe, fetch, models, selftest) stay in this console
 "%VENV%\Scripts\python.exe" "%~dp0verbatim.py" %*

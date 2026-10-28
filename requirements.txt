@@ -9,3 +9,5 @@ imageio-ffmpeg>=0.5.1
 certifi>=2024.2.2
 # Drag and drop onto the window. The app works without it if it fails to load.
 tkinterdnd2>=0.4.2
+# (miniaudio, for gapless read-along audio, is installed separately by the run and
+# build scripts: it is optional, and a missing wheel must not stop the install.)
